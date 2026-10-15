@@ -109,4 +109,42 @@ describe("custom message visibility in agent runs", () => {
 			"assistant",
 		]);
 	});
+
+	it("sends a keyed tail message last and replaces it with the next one of the same key", async () => {
+		const requests: string[][] = [];
+		let turn = 0;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", () => {
+						turn++;
+						pi.sendMessage({
+							customType: "status",
+							content: `status ${turn}`,
+							display: false,
+							visibility: { key: "status" },
+							position: "tail",
+						});
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			(context) => {
+				requests.push(texts(context.messages));
+				return fauxAssistantMessage("first");
+			},
+			(context) => {
+				requests.push(texts(context.messages));
+				return fauxAssistantMessage("second");
+			},
+		]);
+
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		expect(requests[0]).toEqual(["system:", "user:one", "user:status 1"]);
+		expect(requests[1]).toEqual(["system:", "user:one", "assistant:first", "user:two", "user:status 2"]);
+	});
 });

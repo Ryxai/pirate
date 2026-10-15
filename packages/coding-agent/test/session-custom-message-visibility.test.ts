@@ -22,6 +22,11 @@ function assistant(text: string): AssistantMessage {
 	};
 }
 
+function getCustomText(message: { role: string; content?: unknown }): string {
+	if (message.role !== "custom") return "";
+	return typeof message.content === "string" ? message.content : "";
+}
+
 function projectedRoles(session: SessionManager): string[] {
 	return session.buildSessionProjection().messages.map((message) => message.role);
 }
@@ -115,5 +120,78 @@ describe("custom message visibility", () => {
 
 		const plainId = session.appendCustomMessageEntry("note", "always", false);
 		expect(session.getEntry(plainId)).not.toHaveProperty("visibility");
+	});
+
+	it("drops an until-assistantMessages entry after the n-th response", () => {
+		const session = SessionManager.inMemory();
+		session.appendCustomMessageEntry("nudge", "run the tests", false, undefined, {
+			until: { assistantMessages: 2 },
+		});
+		session.appendMessage(assistant("first"));
+		expect(projectedRoles(session)).toEqual(["custom", "assistant"]);
+
+		session.appendMessage(assistant("second"));
+		expect(projectedRoles(session)).toEqual(["assistant", "assistant"]);
+	});
+
+	it("drops an until-customType entry once a custom entry or message of that type follows", () => {
+		const session = SessionManager.inMemory();
+		session.appendCustomMessageEntry("plan", "the plan", false, undefined, { until: { customType: "flow.phase" } });
+		session.appendMessage(assistant("working"));
+		expect(projectedRoles(session)).toEqual(["custom", "assistant"]);
+
+		session.appendCustomEntry("flow.phase", { phase: "implement" });
+		expect(projectedRoles(session)).toEqual(["assistant"]);
+
+		const second = SessionManager.inMemory();
+		second.appendCustomMessageEntry("plan", "the plan", false, undefined, { until: { customType: "flow.phase" } });
+		second.appendCustomMessageEntry("flow.phase", "next phase", false);
+		expect(second.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual(["next phase"]);
+	});
+
+	it("lets a later custom message with the same key supersede an earlier one", () => {
+		const session = SessionManager.inMemory();
+		session.appendCustomMessageEntry("git", "status: clean", false, undefined, { key: "git-status" });
+		session.appendMessage(assistant("edited a file"));
+		session.appendCustomMessageEntry("git", "status: dirty", false, undefined, { key: "git-status" });
+		session.appendCustomMessageEntry("git", "other key", false, undefined, { key: "git-branch" });
+
+		expect(session.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual([
+			"",
+			"status: dirty",
+			"other key",
+		]);
+	});
+
+	it("lets a context edit appended after the expiry point override it", () => {
+		const session = SessionManager.inMemory();
+		const id = session.appendCustomMessageEntry("prelude", "think first", false, undefined, {
+			until: "assistant_message",
+		});
+		session.appendContextEdit(id, { content: "edited before expiry" });
+		session.appendMessage(assistant("answer"));
+		expect(projectedRoles(session)).toEqual(["assistant"]);
+
+		session.appendContextEdit(id, { content: "restored after expiry" });
+		expect(session.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual([
+			"restored after expiry",
+			"",
+		]);
+
+		session.appendContextEdit(id, null);
+		expect(projectedRoles(session)).toEqual(["assistant"]);
+	});
+
+	it("projects tail messages after every other message", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage({ role: "user", content: "request", timestamp: Date.now() });
+		const tailId = session.appendCustomMessageEntry("status", "open files", false, undefined, undefined, "tail");
+		session.appendMessage(assistant("answer"));
+		session.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+
+		const projection = session.buildSessionProjection();
+		expect(projection.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "custom"]);
+		expect(projection.entries.map((entry) => entry.sourceEntry.id).at(-1)).toBe(tailId);
+		expect(session.getEntry(tailId)).toMatchObject({ position: "tail" });
 	});
 });

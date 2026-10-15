@@ -959,6 +959,7 @@ export class AgentSession {
 						draft.display,
 						draft.details,
 						draft.visibility,
+						draft.position,
 					);
 					break;
 				case "context_edit":
@@ -1157,6 +1158,7 @@ export class AgentSession {
 					event.message.display,
 					event.message.details,
 					event.message.visibility,
+					event.message.position,
 				);
 			} else if (
 				event.message.role === "system" ||
@@ -2323,12 +2325,12 @@ export class AgentSession {
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
-	 * @param message Custom message with customType, content, display, details, visibility
+	 * @param message Custom message with customType, content, display, details, visibility, position
 	 * @param options.triggerTurn If true and not streaming, triggers a new LLM turn
 	 * @param options.deliverAs Delivery mode: "steer", "followUp", or "nextTurn"
 	 */
 	async sendCustomMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility">,
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility" | "position">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		const appMessage = {
@@ -2339,6 +2341,7 @@ export class AgentSession {
 			display: message.display,
 			details: message.details,
 			...(message.visibility ? { visibility: message.visibility } : {}),
+			...(message.position ? { position: message.position } : {}),
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
@@ -2373,6 +2376,7 @@ export class AgentSession {
 			appMessage.display,
 			appMessage.details,
 			appMessage.visibility,
+			appMessage.position,
 		);
 		this._refreshFinalizedContext();
 		this._emit({ type: "message_start", message: appMessage });

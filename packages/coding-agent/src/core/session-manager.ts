@@ -34,6 +34,7 @@ import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
+	type CustomMessageExpiry,
 	type CustomMessageVisibility,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
@@ -158,6 +159,7 @@ export interface SessionInfoEntry extends SessionEntryBase {
  * - true: rendered with distinct styling (different from user messages)
  *
  * visibility bounds the time in LLM context (see CustomMessageVisibility). Omitted = permanent.
+ * position "tail" projects the message after every other message of the request.
  */
 export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	type: "custom_message";
@@ -166,6 +168,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	details?: T;
 	display: boolean;
 	visibility?: CustomMessageVisibility;
+	position?: "tail";
 }
 
 /** Content that an append-only context edit may replace without changing message metadata. */
@@ -463,6 +466,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 				entry.details,
 				entry.timestamp,
 				entry.visibility,
+				entry.position,
 			),
 		];
 	}
@@ -550,33 +554,51 @@ function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undef
 	});
 }
 
-function matchesVisibilityUntil(entry: SessionEntry, until: CustomMessageVisibility["until"]): boolean {
-	switch (until) {
-		case "assistant_message":
-			return entry.type === "message" && entry.message.role === "assistant";
-		case "user_message":
-			return entry.type === "message" && entry.message.role === "user";
-		case "compaction":
-			return entry.type === "compaction";
-	}
+/** A custom message with visibility, waiting for the entry that ends it. */
+interface PendingExpiry {
+	entry: CustomMessageEntry;
+	/** Assistant messages seen since the custom message. */
+	assistantMessages: number;
 }
 
-/** IDs of the custom messages on `path` that an entry matching their `until` condition follows. */
-function findExpiredCustomMessages(path: SessionEntry[]): Set<string> {
-	const expired = new Set<string>();
-	const pending: { id: string; until: CustomMessageVisibility["until"] }[] = [];
-	for (const entry of path) {
+function matchesExpiry(until: CustomMessageExpiry, entry: SessionEntry, assistantMessages: number): boolean {
+	const isAssistant = entry.type === "message" && entry.message.role === "assistant";
+	if (typeof until === "string") {
+		switch (until) {
+			case "assistant_message":
+				return isAssistant;
+			case "user_message":
+				return entry.type === "message" && entry.message.role === "user";
+			case "compaction":
+				return entry.type === "compaction";
+		}
+	}
+	if ("assistantMessages" in until) return isAssistant && assistantMessages >= until.assistantMessages;
+	return (entry.type === "custom" || entry.type === "custom_message") && entry.customType === until.customType;
+}
+
+function endsVisibility(pending: PendingExpiry, entry: SessionEntry): boolean {
+	const { until, key } = pending.entry.visibility!;
+	if (key !== undefined && entry.type === "custom_message" && entry.visibility?.key === key) return true;
+	return until !== undefined && matchesExpiry(until, entry, pending.assistantMessages);
+}
+
+/** Index on `path` of the entry that ends each custom message's visibility, for the messages that have one. */
+function findCustomMessageExpiries(path: SessionEntry[]): Map<string, number> {
+	const expiries = new Map<string, number>();
+	const pending: PendingExpiry[] = [];
+	path.forEach((entry, index) => {
+		const isAssistant = entry.type === "message" && entry.message.role === "assistant";
 		for (let i = pending.length - 1; i >= 0; i--) {
-			if (matchesVisibilityUntil(entry, pending[i].until)) {
-				expired.add(pending[i].id);
+			if (isAssistant) pending[i].assistantMessages++;
+			if (endsVisibility(pending[i], entry)) {
+				expiries.set(pending[i].entry.id, index);
 				pending.splice(i, 1);
 			}
 		}
-		if (entry.type === "custom_message" && entry.visibility) {
-			pending.push({ id: entry.id, until: entry.visibility.until });
-		}
-	}
-	return expired;
+		if (entry.type === "custom_message" && entry.visibility) pending.push({ entry, assistantMessages: 0 });
+	});
+	return expiries;
 }
 
 /** Build provenance-preserving, compaction-aware model context. */
@@ -592,22 +614,28 @@ export function buildSessionProjection(
 	for (const entry of contextEntries) {
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
-	const expired = findExpiredCustomMessages(path);
-	const projectedEntries = contextEntries.map(
-		(sourceEntry, index): ProjectedSessionEntry => ({
+	const pathIndex = new Map(path.map((entry, index) => [entry.id, index]));
+	const expiries = findCustomMessageExpiries(path);
+	const projectedEntries = contextEntries.map((sourceEntry, index): ProjectedSessionEntry => {
+		const edit = edits.get(sourceEntry.id);
+		const expiry = expiries.get(sourceEntry.id);
+		// An expiry is an implicit omission at the ending entry; an edit appended later overrides it.
+		const expired = expiry !== undefined && (edit === undefined || (pathIndex.get(edit.id) ?? -1) < expiry);
+		return {
 			sourceEntry,
 			// buildContextEntries() may retain an older compaction entry because its
 			// raw ID lies inside the newest retained range. Only the newest compaction
 			// at index zero contributes a checkpoint and summary.
 			messages:
-				(sourceEntry.type === "compaction" && index > 0) || expired.has(sourceEntry.id)
-					? []
-					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
-		}),
-	);
+				(sourceEntry.type === "compaction" && index > 0) || expired ? [] : projectContextEntry(sourceEntry, edit),
+		};
+	});
+	const isTail = (entry: ProjectedSessionEntry) =>
+		entry.sourceEntry.type === "custom_message" && entry.sourceEntry.position === "tail";
+	const ordered = [...projectedEntries.filter((entry) => !isTail(entry)), ...projectedEntries.filter(isTail)];
 	return {
-		entries: projectedEntries,
-		messages: projectedEntries.flatMap((entry) => entry.messages),
+		entries: ordered,
+		messages: ordered.flatMap((entry) => entry.messages),
 		thinkingLevel,
 		model,
 	};
@@ -1376,6 +1404,7 @@ export class SessionManager {
 	 * @param display Whether to show in TUI (true = styled display, false = hidden)
 	 * @param details Optional extension-specific metadata (not sent to LLM)
 	 * @param visibility Optional lifetime in LLM context (see CustomMessageVisibility)
+	 * @param position "tail" projects the message after every other message of the request
 	 * @returns Entry id
 	 */
 	appendCustomMessageEntry<T = unknown>(
@@ -1384,6 +1413,7 @@ export class SessionManager {
 		display: boolean,
 		details?: T,
 		visibility?: CustomMessageVisibility,
+		position?: "tail",
 	): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
@@ -1392,6 +1422,7 @@ export class SessionManager {
 			display,
 			details,
 			...(visibility ? { visibility } : {}),
+			...(position ? { position } : {}),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),

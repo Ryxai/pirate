@@ -218,7 +218,7 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
-export { type CustomMessageVisibility, convertToLlm } from "./core/messages.ts";
+export { type CustomMessageExpiry, type CustomMessageVisibility, convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
 	type ModelScopeDiagnostic,

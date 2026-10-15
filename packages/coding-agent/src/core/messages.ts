@@ -40,15 +40,29 @@ export interface BashExecutionMessage {
 }
 
 /**
- * Lifetime of a custom message in model context. The message is omitted from the projection
- * once an entry of the named kind follows it on the active branch. The condition is evaluated
- * over session entries, so it holds after resume and on every branch.
+ * When a custom message leaves model context. Conditions are evaluated over the entries that
+ * follow the message on the active branch, so they hold after resume and on every branch.
  * - `assistant_message`: sent with one request, dropped once the model has answered
  * - `user_message`: kept through the tool-call turns of the current run
  * - `compaction`: dropped at the next compaction, whether or not it keeps the entry
+ * - `{ assistantMessages: n }`: dropped after the n-th assistant response
+ * - `{ customType }`: dropped once a custom entry or custom message of that type follows
+ */
+export type CustomMessageExpiry =
+	| "assistant_message"
+	| "user_message"
+	| "compaction"
+	| { assistantMessages: number }
+	| { customType: string };
+
+/**
+ * Lifetime of a custom message in model context. A context edit appended after the expiry point
+ * overrides it, so an expired message can be restored or edited later.
  */
 export interface CustomMessageVisibility {
-	until: "assistant_message" | "user_message" | "compaction";
+	until?: CustomMessageExpiry;
+	/** A later custom message with the same key supersedes this one. */
+	key?: string;
 }
 
 /**
@@ -63,6 +77,8 @@ export interface CustomMessage<T = unknown> {
 	details?: T;
 	/** Omitted: the message stays in model context like any other. */
 	visibility?: CustomMessageVisibility;
+	/** "tail" projects the message after every other message of the request, whatever its branch position. */
+	position?: "tail";
 	timestamp: number;
 }
 
@@ -141,6 +157,7 @@ export function createCustomMessage(
 	details: unknown | undefined,
 	timestamp: string,
 	visibility?: CustomMessageVisibility,
+	position?: "tail",
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -149,6 +166,7 @@ export function createCustomMessage(
 		display,
 		details,
 		...(visibility ? { visibility } : {}),
+		...(position ? { position } : {}),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
