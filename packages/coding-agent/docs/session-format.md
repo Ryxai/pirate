@@ -144,7 +144,7 @@ Append-only edit of one earlier context-producing entry. It changes only future 
 {"type":"context_edit","id":"g6h7i8j9","parentId":"f6g7h8i9","timestamp":"2024-12-03T14:11:00.000Z","targetId":"c3d4e5f6","replacement":null}
 ```
 
-Targets may be user, assistant, tool-result, or custom-message entries. `replacement: null` omits the target from model context. `replacement: "source"` restores the target's original content. Any other `replacement` replaces only the target message content. String replacements for assistant and tool-result entries are normalized to one text block because those roles require content arrays. If several edits target the same entry, the latest edit on the active branch wins. An edit also replaces the target's `visibility`: without one of its own, the edited contribution is permanent; with an optional `visibility` on the edit, it is bounded from the edit onward, with the same conditions as on `custom_message` entries. Edits are branch-relative: navigating to a point before the edit reveals the target's original contribution again.
+Targets may be user, assistant, tool-result, or custom-message entries. `replacement: null` omits the target from model context. `replacement: "source"` restores the target's original content. Any other `replacement` replaces only the target message content. String replacements for assistant and tool-result entries are normalized to one text block because those roles require content arrays. If several edits target the same entry, the latest edit on the active branch wins. An edit keeps the target's `visibility`, counted from the edit, unless it carries its own: `visibility: {}` makes the contribution permanent, and any other value bounds it with the same conditions as on `custom_message` entries. Edits are branch-relative: navigating to a point before the edit reveals the target's original contribution again.
 
 ### BranchSummaryEntry
 
@@ -234,7 +234,7 @@ Entries normally form one tree, but navigation APIs can create multiple roots:
    - Includes entries after the compaction entry
 3. Preserves non-message entries in the selected range so interactive mode can render them
 
-`buildSessionProjection()` then applies the latest `context_edit` for each selected target and omits `custom_message` entries whose `visibility` has ended, i.e. a matching entry follows them on the path, unless a `context_edit` appended after that entry overrides it. Entries with `position: "tail"` move after all others. It returns the model-visible messages together with their source entries. Omitted targets produce no message; replacements retain the source entry's role and metadata while changing only content. The raw selected entries are not modified.
+`buildSessionProjection()` then applies the latest `context_edit` for each selected target and omits `custom_message` entries whose `visibility` has ended, i.e. a matching entry follows them on the path, unless a `context_edit` appended after that entry overrides it. Entries and messages stay in branch order; `buildSessionContext()` and requests move `position: "tail"` messages last. It returns the model-visible messages together with their source entries. Omitted targets produce no message; replacements retain the source entry's role and metadata while changing only content. The raw selected entries are not modified.
 
 `buildSessionContext()` builds on that projection to produce the message list for the LLM:
 

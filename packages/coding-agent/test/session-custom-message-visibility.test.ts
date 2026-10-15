@@ -1,259 +1,314 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { fauxAssistantMessage, fauxToolCall, type ToolResultMessage, type UserMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { estimateProjectedContextTokens, prepareCompaction } from "../src/core/compaction/index.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
-function assistant(text: string): AssistantMessage {
+function label(message: AgentMessage): string {
+	switch (message.role) {
+		case "user":
+		case "custom":
+			return `${message.role}:${typeof message.content === "string" ? message.content : ""}`;
+		default:
+			return message.role;
+	}
+}
+
+function projected(session: SessionManager): string[] {
+	return session.buildSessionProjection().messages.map(label);
+}
+
+function user(content: string): UserMessage {
+	return { role: "user", content, timestamp: Date.now() };
+}
+
+function toolResult(toolCallId: string, text: string): ToolResultMessage {
 	return {
-		role: "assistant",
+		role: "toolResult",
+		toolCallId,
+		toolName: "read",
 		content: [{ type: "text", text }],
-		api: "faux",
-		provider: "faux",
-		model: "faux",
-		usage: {
-			input: 10,
-			output: 1,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 11,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
+		isError: false,
 		timestamp: Date.now(),
 	};
-}
-
-function getCustomText(message: { role: string; content?: unknown }): string {
-	if (message.role !== "custom") return "";
-	return typeof message.content === "string" ? message.content : "";
-}
-
-function projectedRoles(session: SessionManager): string[] {
-	return session.buildSessionProjection().messages.map((message) => message.role);
 }
 
 describe("custom message visibility", () => {
 	it("keeps a message without visibility in context", () => {
 		const session = SessionManager.inMemory();
-		session.appendCustomMessageEntry("note", "always", false);
-		session.appendMessage(assistant("reply"));
-		session.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
-
-		expect(projectedRoles(session)).toEqual(["custom", "assistant", "user"]);
+		session.appendCustomMessageEntry({ customType: "note", content: "always", display: false });
+		session.appendMessage(fauxAssistantMessage("reply"));
+		session.appendMessage(user("next"));
+		expect(projected(session)).toEqual(["custom:always", "assistant", "user:next"]);
 	});
 
 	it("drops an until-assistant_message entry once the model has answered", () => {
 		const session = SessionManager.inMemory();
-		session.appendMessage({ role: "user", content: "request", timestamp: Date.now() });
-		const id = session.appendCustomMessageEntry("prelude", "think first", false, undefined, {
-			until: "assistant_message",
+		session.appendMessage(user("request"));
+		const id = session.appendCustomMessageEntry({
+			customType: "prelude",
+			content: "think first",
+			display: false,
+			visibility: { until: "assistant_message" },
 		});
+		expect(projected(session)).toEqual(["user:request", "custom:think first"]);
 
-		expect(projectedRoles(session)).toEqual(["user", "custom"]);
-		expect(
-			session.buildSessionProjection().entries.find((entry) => entry.sourceEntry.id === id)?.messages,
-		).toHaveLength(1);
-
-		session.appendMessage(assistant("answer"));
-
-		expect(projectedRoles(session)).toEqual(["user", "assistant"]);
-		const projected = session.buildSessionProjection().entries.find((entry) => entry.sourceEntry.id === id);
-		expect(projected?.sourceEntry.type).toBe("custom_message");
-		expect(projected?.messages).toEqual([]);
+		session.appendMessage(fauxAssistantMessage("answer"));
+		expect(projected(session)).toEqual(["user:request", "assistant"]);
+		const entry = session.buildSessionProjection().entries.find((entry) => entry.sourceEntry.id === id);
+		expect(entry).toMatchObject({ sourceEntry: { type: "custom_message" }, messages: [] });
 	});
 
 	it("keeps an until-user_message entry through tool-call turns of the same run", () => {
 		const session = SessionManager.inMemory();
-		session.appendMessage({ role: "user", content: "request", timestamp: Date.now() });
-		session.appendCustomMessageEntry("prelude", "plan", false, undefined, { until: "user_message" });
-		session.appendMessage(assistant("calling a tool"));
-		session.appendMessage({
-			role: "toolResult",
-			toolCallId: "call-1",
-			toolName: "read",
-			content: [{ type: "text", text: "output" }],
-			isError: false,
-			timestamp: Date.now(),
+		session.appendMessage(user("request"));
+		session.appendCustomMessageEntry({
+			customType: "prelude",
+			content: "plan",
+			display: false,
+			visibility: { until: "user_message" },
 		});
-		session.appendMessage(assistant("done"));
+		session.appendMessage(
+			fauxAssistantMessage([fauxToolCall("read", {}, { id: "call-1" })], { stopReason: "toolUse" }),
+		);
+		session.appendMessage(toolResult("call-1", "output"));
+		session.appendMessage(fauxAssistantMessage("done"));
+		expect(projected(session)).toEqual(["user:request", "custom:plan", "assistant", "toolResult", "assistant"]);
 
-		expect(projectedRoles(session)).toEqual(["user", "custom", "assistant", "toolResult", "assistant"]);
-
-		session.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
-
-		expect(projectedRoles(session)).toEqual(["user", "assistant", "toolResult", "assistant", "user"]);
+		session.appendMessage(user("next"));
+		expect(projected(session)).toEqual(["user:request", "assistant", "toolResult", "assistant", "user:next"]);
 	});
 
 	it("drops an until-compaction entry even when the compaction keeps it", () => {
 		const session = SessionManager.inMemory();
-		session.appendMessage({ role: "user", content: "request", timestamp: Date.now() });
-		const keptId = session.appendCustomMessageEntry("scratch", "working notes", false, undefined, {
-			until: "compaction",
+		session.appendMessage(user("request"));
+		const keptId = session.appendCustomMessageEntry({
+			customType: "scratch",
+			content: "working notes",
+			display: false,
+			visibility: { until: "compaction" },
 		});
-		session.appendMessage(assistant("answer"));
-
-		expect(projectedRoles(session)).toEqual(["user", "custom", "assistant"]);
+		session.appendMessage(fauxAssistantMessage("answer"));
+		expect(projected(session)).toEqual(["user:request", "custom:working notes", "assistant"]);
 
 		session.appendCompaction("summary", keptId, 100);
-
-		expect(projectedRoles(session)).toEqual(["compactionSummary", "assistant"]);
-	});
-
-	it("evaluates expiry per branch", () => {
-		const session = SessionManager.inMemory();
-		const userId = session.appendMessage({ role: "user", content: "request", timestamp: Date.now() });
-		session.appendCustomMessageEntry("prelude", "think first", false, undefined, { until: "assistant_message" });
-		session.appendMessage(assistant("answer"));
-
-		session.branch(userId);
-		session.appendCustomMessageEntry("prelude", "think again", false, undefined, { until: "assistant_message" });
-
-		expect(projectedRoles(session)).toEqual(["user", "custom"]);
-	});
-
-	it("persists visibility on the entry", () => {
-		const session = SessionManager.inMemory();
-		const id = session.appendCustomMessageEntry("prelude", "think", false, undefined, { until: "assistant_message" });
-		expect(session.getEntry(id)).toMatchObject({
-			type: "custom_message",
-			visibility: { until: "assistant_message" },
-		});
-
-		const plainId = session.appendCustomMessageEntry("note", "always", false);
-		expect(session.getEntry(plainId)).not.toHaveProperty("visibility");
+		expect(projected(session)).toEqual(["compactionSummary", "assistant"]);
 	});
 
 	it("drops an until-assistantMessages entry after the n-th response", () => {
 		const session = SessionManager.inMemory();
-		session.appendCustomMessageEntry("nudge", "run the tests", false, undefined, {
-			until: { assistantMessages: 2 },
+		session.appendCustomMessageEntry({
+			customType: "nudge",
+			content: "run the tests",
+			display: false,
+			visibility: { until: { assistantMessages: 2 } },
 		});
-		session.appendMessage(assistant("first"));
-		expect(projectedRoles(session)).toEqual(["custom", "assistant"]);
+		session.appendMessage(fauxAssistantMessage("first"));
+		expect(projected(session)).toEqual(["custom:run the tests", "assistant"]);
 
-		session.appendMessage(assistant("second"));
-		expect(projectedRoles(session)).toEqual(["assistant", "assistant"]);
+		session.appendMessage(fauxAssistantMessage("second"));
+		expect(projected(session)).toEqual(["assistant", "assistant"]);
 	});
 
 	it("drops an until-customType entry once a custom entry or message of that type follows", () => {
 		const session = SessionManager.inMemory();
-		session.appendCustomMessageEntry("plan", "the plan", false, undefined, { until: { customType: "flow.phase" } });
-		session.appendMessage(assistant("working"));
-		expect(projectedRoles(session)).toEqual(["custom", "assistant"]);
+		session.appendCustomMessageEntry({
+			customType: "plan",
+			content: "the plan",
+			display: false,
+			visibility: { until: { customType: "flow.phase" } },
+		});
+		session.appendMessage(fauxAssistantMessage("working"));
+		expect(projected(session)).toEqual(["custom:the plan", "assistant"]);
 
 		session.appendCustomEntry("flow.phase", { phase: "implement" });
-		expect(projectedRoles(session)).toEqual(["assistant"]);
+		expect(projected(session)).toEqual(["assistant"]);
 
 		const second = SessionManager.inMemory();
-		second.appendCustomMessageEntry("plan", "the plan", false, undefined, { until: { customType: "flow.phase" } });
-		second.appendCustomMessageEntry("flow.phase", "next phase", false);
-		expect(second.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual(["next phase"]);
+		second.appendCustomMessageEntry({
+			customType: "plan",
+			content: "the plan",
+			display: false,
+			visibility: { until: { customType: "flow.phase" } },
+		});
+		second.appendCustomMessageEntry({ customType: "flow.phase", content: "next phase", display: false });
+		expect(projected(second)).toEqual(["custom:next phase"]);
 	});
 
 	it("lets a later custom message with the same key supersede an earlier one", () => {
 		const session = SessionManager.inMemory();
-		session.appendCustomMessageEntry("git", "status: clean", false, undefined, { key: "git-status" });
-		session.appendMessage(assistant("edited a file"));
-		session.appendCustomMessageEntry("git", "status: dirty", false, undefined, { key: "git-status" });
-		session.appendCustomMessageEntry("git", "other key", false, undefined, { key: "git-branch" });
-
-		expect(session.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual([
-			"",
-			"status: dirty",
-			"other key",
-		]);
+		const status = (content: string, key: string) =>
+			session.appendCustomMessageEntry({ customType: "git", content, display: false, visibility: { key } });
+		status("status: clean", "git-status");
+		session.appendMessage(fauxAssistantMessage("edited a file"));
+		status("status: dirty", "git-status");
+		status("other key", "git-branch");
+		expect(projected(session)).toEqual(["assistant", "custom:status: dirty", "custom:other key"]);
 	});
 
-	it("lets the latest context edit replace the target's visibility", () => {
+	it("keeps one copy of a keyed message across a content edit", () => {
 		const session = SessionManager.inMemory();
-		const id = session.appendCustomMessageEntry("prelude", "think first", false, undefined, {
-			until: "assistant_message",
+		const id = session.appendCustomMessageEntry({
+			customType: "git",
+			content: "status: clean",
+			display: false,
+			visibility: { key: "git" },
 		});
-		session.appendMessage(assistant("answer"));
-		expect(projectedRoles(session)).toEqual(["assistant"]);
-
-		session.appendContextEdit(id, { content: "restored after expiry" });
-		expect(session.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual([
-			"restored after expiry",
-			"",
-		]);
-
-		session.appendContextEdit(id, null);
-		expect(projectedRoles(session)).toEqual(["assistant"]);
-
-		// An edit before the expiry point replaces the pending visibility: the contribution is permanent.
-		const second = SessionManager.inMemory();
-		const boundedId = second.appendCustomMessageEntry("prelude", "think first", false, undefined, {
-			until: "assistant_message",
+		session.appendContextEdit(id, { content: "status: clean (edited)" });
+		session.appendMessage(fauxAssistantMessage("answer"));
+		session.appendCustomMessageEntry({
+			customType: "git",
+			content: "status: dirty",
+			display: false,
+			visibility: { key: "git" },
 		});
-		second.appendContextEdit(boundedId, { content: "edited before expiry" });
-		second.appendMessage(assistant("answer"));
-		expect(second.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual([
-			"edited before expiry",
-			"",
-		]);
+		expect(projected(session)).toEqual(["assistant", "custom:status: dirty"]);
 	});
 
-	it("projects tail messages after every other message", () => {
+	it("evaluates expiry per branch", () => {
 		const session = SessionManager.inMemory();
-		session.appendMessage({ role: "user", content: "request", timestamp: Date.now() });
-		const tailId = session.appendCustomMessageEntry("status", "open files", false, undefined, undefined, "tail");
-		session.appendMessage(assistant("answer"));
-		session.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+		const userId = session.appendMessage(user("request"));
+		const prelude = () =>
+			session.appendCustomMessageEntry({
+				customType: "prelude",
+				content: "think",
+				display: false,
+				visibility: { until: "assistant_message" },
+			});
+		prelude();
+		session.appendMessage(fauxAssistantMessage("answer"));
+
+		session.branch(userId);
+		prelude();
+		expect(projected(session)).toEqual(["user:request", "custom:think"]);
+	});
+
+	it("persists visibility and position on the entry", () => {
+		const session = SessionManager.inMemory();
+		const id = session.appendCustomMessageEntry({
+			customType: "status",
+			content: "open files",
+			display: false,
+			visibility: { until: "assistant_message" },
+			position: "tail",
+		});
+		expect(session.getEntry(id)).toMatchObject({ visibility: { until: "assistant_message" }, position: "tail" });
+
+		const plainId = session.appendCustomMessageEntry({ customType: "note", content: "always", display: false });
+		expect(session.getEntry(plainId)).not.toHaveProperty("visibility");
+		expect(session.getEntry(plainId)).not.toHaveProperty("position");
+	});
+
+	it("keeps entries in branch order and moves tail messages last in the session context", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage(user("request"));
+		const tailId = session.appendCustomMessageEntry({
+			customType: "status",
+			content: "open files",
+			display: false,
+			position: "tail",
+		});
+		session.appendMessage(fauxAssistantMessage("answer"));
+		session.appendMessage(user("next"));
 
 		const projection = session.buildSessionProjection();
-		expect(projection.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "custom"]);
-		expect(projection.entries.map((entry) => entry.sourceEntry.id).at(-1)).toBe(tailId);
-		expect(session.getEntry(tailId)).toMatchObject({ position: "tail" });
+		expect(projection.entries.map((entry) => entry.sourceEntry.id)[1]).toBe(tailId);
+		expect(projection.messages.map(label)).toEqual(["user:request", "custom:open files", "assistant", "user:next"]);
+		expect(session.buildSessionContext().messages.map(label)).toEqual([
+			"user:request",
+			"assistant",
+			"user:next",
+			"custom:open files",
+		]);
+	});
+
+	it("counts a tail message once in the token estimate", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage(user("request"));
+		session.appendCustomMessageEntry({
+			customType: "status",
+			content: "x".repeat(4000),
+			display: false,
+			position: "tail",
+		});
+		const answer = fauxAssistantMessage("answer");
+		session.appendMessage({ ...answer, usage: { ...answer.usage, input: 2000, totalTokens: 2001 } });
+
+		const estimate = estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch());
+		expect(estimate.trailingTokens).toBe(0);
+	});
+
+	it("never cuts a compaction at a tail entry and keeps it after compacting", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage(user("first"));
+		const tailId = session.appendCustomMessageEntry({
+			customType: "status",
+			content: "TAIL STATE",
+			display: false,
+			position: "tail",
+		});
+		for (const turn of ["one", "two", "three"]) {
+			session.appendMessage(fauxAssistantMessage(`${turn} `.repeat(100)));
+			session.appendMessage(user(turn));
+		}
+		session.appendMessage(fauxAssistantMessage([fauxToolCall("read", {}, { id: "c1" })], { stopReason: "toolUse" }));
+		session.appendMessage(toolResult("c1", "r1 ".repeat(100)));
+
+		const preparation = prepareCompaction(session.getBranch(), {
+			enabled: true,
+			reserveTokens: 10,
+			keepRecentTokens: 60,
+		});
+		expect(preparation).toBeDefined();
+		expect(preparation?.firstKeptEntryId).not.toBe(tailId);
+		expect(JSON.stringify(preparation?.messagesToSummarize)).toContain("TAIL STATE");
+
+		session.appendCompaction("summary", preparation!.firstKeptEntryId, 100);
+		expect(session.buildSessionProjection().messages.length).toBeLessThan(10);
 	});
 
 	it("restores the source content with a source edit", () => {
 		const session = SessionManager.inMemory();
-		const id = session.appendCustomMessageEntry("note", "original", false);
+		const id = session.appendCustomMessageEntry({ customType: "note", content: "original", display: false });
 		session.appendContextEdit(id, { content: "replaced" });
 		session.appendContextEdit(id, "source");
-		expect(session.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual(["original"]);
+		expect(projected(session)).toEqual(["custom:original"]);
 
-		const resultId = session.appendMessage({
-			role: "toolResult",
-			toolCallId: "call-1",
-			toolName: "read",
-			content: [{ type: "text", text: "file contents" }],
-			isError: false,
-			timestamp: Date.now(),
-		});
+		const resultId = session.appendMessage(toolResult("call-1", "file contents"));
 		session.appendContextEdit(resultId, null);
-		expect(projectedRoles(session)).toEqual(["custom"]);
+		expect(projected(session)).toEqual(["custom:original"]);
 		session.appendContextEdit(resultId, "source");
-		expect(projectedRoles(session)).toEqual(["custom", "toolResult"]);
+		expect(projected(session)).toEqual(["custom:original", "toolResult"]);
 	});
 
-	it("bounds a restoring edit by its own visibility", () => {
+	it("gives an edit the target's visibility unless it carries its own", () => {
 		const session = SessionManager.inMemory();
-		const id = session.appendCustomMessageEntry("prelude", "think first", false, undefined, {
-			until: "assistant_message",
+		const id = session.appendCustomMessageEntry({
+			customType: "prelude",
+			content: "think first",
+			display: false,
+			visibility: { until: "assistant_message" },
 		});
-		session.appendMessage(assistant("answer"));
-		session.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
-		expect(projectedRoles(session)).toEqual(["assistant", "user"]);
+		session.appendContextEdit(id, { content: "edited" });
+		session.appendMessage(fauxAssistantMessage("answer"));
+		expect(projected(session)).toEqual(["assistant"]);
 
-		session.appendContextEdit(id, "source", { until: "assistant_message" });
-		expect(projectedRoles(session)).toEqual(["custom", "assistant", "user"]);
-
-		session.appendMessage(assistant("second answer"));
-		expect(projectedRoles(session)).toEqual(["assistant", "user", "assistant"]);
-
+		// Restored after expiry: the inherited lifetime counts from the edit.
 		session.appendContextEdit(id, "source");
-		session.appendMessage(assistant("third answer"));
-		expect(projectedRoles(session)).toEqual(["custom", "assistant", "user", "assistant", "assistant"]);
-	});
+		expect(projected(session)).toEqual(["custom:think first", "assistant"]);
+		session.appendMessage(fauxAssistantMessage("second answer"));
+		expect(projected(session)).toEqual(["assistant", "assistant"]);
 
-	it("replaces a pending expiry when a later edit targets the same entry", () => {
-		const session = SessionManager.inMemory();
-		const id = session.appendCustomMessageEntry("prelude", "think first", false, undefined, {
-			until: "assistant_message",
-		});
-		session.appendContextEdit(id, "source");
-		session.appendMessage(assistant("answer"));
-		expect(projectedRoles(session)).toEqual(["custom", "assistant"]);
+		// A rebounded restore and a permanent one.
+		session.appendContextEdit(id, "source", { until: { assistantMessages: 2 } });
+		session.appendMessage(fauxAssistantMessage("third answer"));
+		expect(projected(session)).toEqual(["custom:think first", "assistant", "assistant", "assistant"]);
+		session.appendContextEdit(id, "source", {});
+		session.appendMessage(fauxAssistantMessage("fourth answer"));
+		session.appendMessage(fauxAssistantMessage("fifth answer"));
+		expect(projected(session)[0]).toBe("custom:think first");
+
+		session.appendContextEdit(id, null);
+		expect(projected(session)[0]).toBe("assistant");
 	});
 });

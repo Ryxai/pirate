@@ -3451,15 +3451,7 @@ export class InteractiveMode {
 					this.addCacheWarmingUsage(event.entry);
 					this.ui.requestRender();
 				} else if (event.entry.type === "custom_message" && event.entry.display) {
-					this.addMessageToChat(
-						createCustomMessage(
-							event.entry.customType,
-							event.entry.content,
-							event.entry.display,
-							event.entry.details,
-							event.entry.timestamp,
-						),
-					);
+					this.addMessageToChat(createCustomMessage(event.entry, event.entry.timestamp));
 					this.ui.requestRender();
 				} else if (event.entry.type === "compaction") {
 					const entries = this.sessionManager.buildContextEntries();

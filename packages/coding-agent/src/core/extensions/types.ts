@@ -65,7 +65,7 @@ import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
-import type { CustomMessage, CustomMessageVisibility } from "../messages.ts";
+import type { ContextVisibility, CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type {
@@ -896,15 +896,20 @@ export type SessionEvent =
  * belong to Pi: it restores them after the handler returns, so a handler cannot drop
  * them and does not need to preserve them.
  */
-export interface ContextEvent {
+/** The provider request being prepared, as `context` handlers see it. */
+export interface ExtensionRequest {
+	/** Physical model the request is routed to. */
+	model: Model<any>;
+	thinkingLevel: ThinkingLevel;
+	/** Token budget of the request against the compaction threshold. */
+	budget: ContextBudget;
+}
+
+export interface ContextEvent extends Partial<ExtensionRequest> {
 	type: "context";
 	messages: AgentMessage[];
 	/** Model the request is routed to, or the session model outside a request. */
 	model: Model<any> | undefined;
-	/** Thinking level of the request; undefined outside a request. */
-	thinkingLevel?: ThinkingLevel;
-	/** Token budget of the request against the compaction threshold; undefined outside a request. */
-	budget?: ContextBudget;
 }
 
 /**
@@ -912,12 +917,10 @@ export interface ContextEvent {
  * the prompt and tool state. `messages` is the full transcript including system messages,
  * and the result is sent as returned: the handler owns the prompt and tool declarations.
  */
-export interface ContextWithSystemEvent {
+export interface ContextWithSystemEvent extends Partial<ExtensionRequest> {
 	type: "context_with_system";
 	messages: AgentMessage[];
 	model: Model<any> | undefined;
-	thinkingLevel?: ThinkingLevel;
-	budget?: ContextBudget;
 }
 
 /** Fired before a provider request is sent. Can replace the payload. */
@@ -1004,7 +1007,7 @@ export interface CustomMessageEntryDraft {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: unknown;
-	visibility?: CustomMessageVisibility;
+	visibility?: ContextVisibility;
 	position?: "tail";
 }
 
@@ -1012,7 +1015,7 @@ export interface ContextEditEntryDraft {
 	type: "context_edit";
 	targetId: string;
 	replacement: ContextEditEntry["replacement"];
-	visibility?: CustomMessageVisibility;
+	visibility?: ContextVisibility;
 }
 
 export interface CompactionEntryDraft {
@@ -1520,7 +1523,7 @@ export interface MessageEndEventResult {
 }
 
 export interface BeforeAgentStartEventResult {
-	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
+	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "visibility" | "position">;
 	/** Replace the complete system prompt for this turn. Later handlers observe this exact override. */
 	systemPrompt?: string;
 }

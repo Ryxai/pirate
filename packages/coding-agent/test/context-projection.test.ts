@@ -1,54 +1,53 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, type UserMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { CONTEXT_RECALL_TYPE, projectContext } from "../src/core/context-projection.ts";
+import { CONTEXT_RECALL_TYPE, type ProjectionFilter, projectContext } from "../src/core/context-projection.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-
-function assistant(text: string, toolCallId?: string): AssistantMessage {
-	return {
-		role: "assistant",
-		content: toolCallId
-			? [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "a.ts" } }]
-			: [{ type: "text", text }],
-		api: "faux",
-		provider: "faux",
-		model: "faux",
-		usage: {
-			input: 10,
-			output: 1,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 11,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: toolCallId ? "toolUse" : "stop",
-		timestamp: Date.now(),
-	};
-}
 
 const BUDGET = { contextWindow: 100_000, reserveTokens: 10_000, baselineTokens: 1_000 };
 
-function session(): { manager: SessionManager; preludeId: string; assistantId: string } {
-	const manager = SessionManager.inMemory();
-	manager.appendMessage({ role: "user", content: "request", timestamp: Date.now() });
-	const preludeId = manager.appendCustomMessageEntry("prelude", "think first", false, undefined, {
-		until: "assistant_message",
-	});
-	const assistantId = manager.appendMessage(assistant("", "call-1"));
-	manager.appendMessage({
+function user(content: string): UserMessage {
+	return { role: "user", content, timestamp: Date.now() };
+}
+
+function toolCallTurn(session: SessionManager, id: string, text: string): string {
+	const assistantId = session.appendMessage(
+		fauxAssistantMessage([fauxToolCall("read", { path: "a.ts" }, { id })], { stopReason: "toolUse" }),
+	);
+	session.appendMessage({
 		role: "toolResult",
-		toolCallId: "call-1",
+		toolCallId: id,
 		toolName: "read",
-		content: [{ type: "text", text: "file contents" }],
+		content: [{ type: "text", text }],
 		isError: false,
 		timestamp: Date.now(),
 	});
-	manager.appendMessage(assistant("done"));
-	manager.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+	return assistantId;
+}
+
+function session(): { manager: SessionManager; preludeId: string; assistantId: string } {
+	const manager = SessionManager.inMemory();
+	manager.appendMessage(user("request"));
+	const preludeId = manager.appendCustomMessageEntry({
+		customType: "prelude",
+		content: "think first",
+		display: false,
+		visibility: { until: "assistant_message" },
+	});
+	const assistantId = toolCallTurn(manager, "call-1", "file contents");
+	manager.appendMessage(fauxAssistantMessage("done"));
+	manager.appendMessage(user("next"));
 	return { manager, preludeId, assistantId };
 }
 
 function roles(messages: { role: string }[]): string[] {
 	return messages.map((message) => message.role);
+}
+
+function includeOnly(
+	id: string,
+	decision: { priority?: number; placement?: "tail" | "in_place" } = {},
+): ProjectionFilter {
+	return (entry) => (entry.sourceEntry.id === id ? { include: true, ...decision } : "default");
 }
 
 describe("projectContext", () => {
@@ -62,6 +61,21 @@ describe("projectContext", () => {
 		expect(result.evicted).toEqual([]);
 	});
 
+	it("moves canonical tail messages last", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendMessage(user("request"));
+		manager.appendCustomMessageEntry({
+			customType: "status",
+			content: "open files",
+			display: false,
+			position: "tail",
+		});
+		manager.appendMessage(fauxAssistantMessage("answer"));
+		const result = projectContext(manager.buildSessionProjection(), BUDGET);
+		expect(roles(result.messages)).toEqual(["user", "assistant", "custom"]);
+		expect(result.tokens).toBe(BUDGET.baselineTokens);
+	});
+
 	it("tells the filter which entries are omitted and what they cost", () => {
 		const { manager, preludeId } = session();
 		const seen = new Map<string, { omitted: boolean; tokens: number }>();
@@ -70,15 +84,27 @@ describe("projectContext", () => {
 			return "default";
 		});
 		expect(seen.get(preludeId)).toMatchObject({ omitted: true });
-		expect(seen.get(preludeId)!.tokens).toBeGreaterThan(0);
+		expect(seen.get(preludeId)?.tokens).toBeGreaterThan(0);
 		expect([...seen.values()].filter((info) => info.omitted)).toHaveLength(1);
+	});
+
+	it("never offers a superseded compaction summary as omitted", () => {
+		const manager = SessionManager.inMemory();
+		const firstId = manager.appendMessage(user("first"));
+		manager.appendMessage(fauxAssistantMessage("answer"));
+		manager.appendCompaction("OLD SUMMARY", firstId, 100);
+		manager.appendMessage(user("second"));
+		manager.appendCompaction("NEW SUMMARY", firstId, 100);
+		const result = projectContext(manager.buildSessionProjection(), BUDGET, (_entry, info) =>
+			info.omitted ? { include: true } : "default",
+		);
+		expect(JSON.stringify(result.messages)).not.toContain("OLD SUMMARY");
+		expect(result.messages.some((message) => message.role === "custom")).toBe(false);
 	});
 
 	it("re-sends an omitted entry at the tail as a recall message by default", () => {
 		const { manager, preludeId } = session();
-		const result = projectContext(manager.buildSessionProjection(), BUDGET, (entry) =>
-			entry.sourceEntry.id === preludeId ? { include: true } : "default",
-		);
+		const result = projectContext(manager.buildSessionProjection(), BUDGET, includeOnly(preludeId));
 		expect(roles(result.messages)).toEqual(["user", "assistant", "toolResult", "assistant", "user", "custom"]);
 		expect(result.messages.at(-1)).toMatchObject({
 			role: "custom",
@@ -93,14 +119,10 @@ describe("projectContext", () => {
 		const { manager } = session();
 		const projection = manager.buildSessionProjection();
 		const firstUser = projection.entries[0].sourceEntry.id;
-		const kept = projectContext(projection, BUDGET, (entry) =>
-			entry.sourceEntry.id === firstUser ? { include: true } : "default",
-		);
+		const kept = projectContext(projection, BUDGET, includeOnly(firstUser));
 		expect(kept.messages).toEqual(projection.messages);
 
-		const moved = projectContext(projection, BUDGET, (entry) =>
-			entry.sourceEntry.id === firstUser ? { include: true, placement: "tail" } : "default",
-		);
+		const moved = projectContext(projection, BUDGET, includeOnly(firstUser, { placement: "tail" }));
 		expect(roles(moved.messages)).toEqual(["assistant", "toolResult", "assistant", "user", "custom"]);
 		expect(moved.messages.at(-1)).toMatchObject({
 			customType: CONTEXT_RECALL_TYPE,
@@ -111,70 +133,71 @@ describe("projectContext", () => {
 
 	it("puts an omitted entry back in place when asked", () => {
 		const { manager, preludeId } = session();
-		const result = projectContext(manager.buildSessionProjection(), BUDGET, (entry) =>
-			entry.sourceEntry.id === preludeId ? { include: true, placement: "in_place" } : "default",
+		const result = projectContext(
+			manager.buildSessionProjection(),
+			BUDGET,
+			includeOnly(preludeId, { placement: "in_place" }),
 		);
 		expect(roles(result.messages)).toEqual(["user", "custom", "assistant", "toolResult", "assistant", "user"]);
 		expect(result.messages[1]).toMatchObject({ role: "custom", customType: "prelude" });
 	});
 
-	it("drops tool results whose call was omitted", () => {
+	it("drops tool results whose call was omitted or moved, and accounts for them", () => {
 		const { manager, assistantId } = session();
-		const result = projectContext(manager.buildSessionProjection(), BUDGET, (entry) =>
+		const projection = manager.buildSessionProjection();
+		const omitted = projectContext(projection, BUDGET, (entry) =>
 			entry.sourceEntry.id === assistantId ? "omit" : "default",
 		);
-		expect(roles(result.messages)).toEqual(["user", "assistant", "user"]);
-		expect(result.tokens).toBeLessThan(BUDGET.baselineTokens);
+		expect(roles(omitted.messages)).toEqual(["user", "assistant", "user"]);
+		expect(omitted.tokens).toBeLessThan(BUDGET.baselineTokens);
+
+		const moved = projectContext(projection, BUDGET, includeOnly(assistantId, { placement: "tail" }));
+		expect(roles(moved.messages)).toEqual(["user", "assistant", "user"]);
+		expect(moved.tokens).toBeLessThan(BUDGET.baselineTokens);
 	});
 
 	it("evicts additions lowest priority first, then oldest, to stay under the threshold", () => {
 		const manager = SessionManager.inMemory();
-		const low = manager.appendCustomMessageEntry("note", "a".repeat(400), false, undefined, {
-			until: "assistant_message",
-		});
-		const high = manager.appendCustomMessageEntry("note", "b".repeat(400), false, undefined, {
-			until: "assistant_message",
-		});
-		const other = manager.appendCustomMessageEntry("note", "c".repeat(400), false, undefined, {
-			until: "assistant_message",
-		});
-		manager.appendMessage(assistant("answer"));
+		const note = (content: string) =>
+			manager.appendCustomMessageEntry({
+				customType: "note",
+				content,
+				display: false,
+				visibility: { until: "assistant_message" },
+			});
+		const low = note("a".repeat(400));
+		const high = note("b".repeat(400));
+		const other = note("c".repeat(400));
+		manager.appendMessage(fauxAssistantMessage("answer"));
 		const projection = manager.buildSessionProjection();
 		const priorities = new Map([
 			[low, 0],
 			[high, 1],
 			[other, 1],
 		]);
-		const filter = (entry: { sourceEntry: { id: string } }) => {
+		const filter: ProjectionFilter = (entry) => {
 			const priority = priorities.get(entry.sourceEntry.id);
-			return priority === undefined ? "default" : { include: true as const, priority };
+			return priority === undefined ? "default" : { include: true, priority };
 		};
 		const cost = new Map<string, number>();
 		projectContext(projection, BUDGET, (entry, info) => {
 			cost.set(entry.sourceEntry.id, info.tokens);
-			return filter(entry);
+			return filter(entry, info);
 		});
-		const total = cost.get(low)! + cost.get(high)! + cost.get(other)!;
+		const total = (cost.get(low) ?? 0) + (cost.get(high) ?? 0) + (cost.get(other) ?? 0);
+		const budget = (contextWindow: number) => ({ ...BUDGET, reserveTokens: 0, contextWindow });
 
-		const fits = projectContext(
-			projection,
-			{ ...BUDGET, reserveTokens: 0, contextWindow: BUDGET.baselineTokens + total },
-			filter,
-		);
+		const fits = projectContext(projection, budget(BUDGET.baselineTokens + total), filter);
 		expect(fits.evicted).toEqual([]);
 		expect(roles(fits.messages)).toEqual(["assistant", "custom", "custom", "custom"]);
 
-		const oneShort = projectContext(
-			projection,
-			{ ...BUDGET, reserveTokens: 0, contextWindow: BUDGET.baselineTokens + total - 1 },
-			filter,
-		);
+		const oneShort = projectContext(projection, budget(BUDGET.baselineTokens + total - 1), filter);
 		expect(oneShort.evicted.map((item) => item.entry.sourceEntry.id)).toEqual([low]);
-		expect(oneShort.tokens).toBe(BUDGET.baselineTokens + total - cost.get(low)!);
+		expect(oneShort.tokens).toBe(BUDGET.baselineTokens + total - (cost.get(low) ?? 0));
 
 		const twoShort = projectContext(
 			projection,
-			{ ...BUDGET, reserveTokens: 0, contextWindow: BUDGET.baselineTokens + total - cost.get(low)! - 1 },
+			budget(BUDGET.baselineTokens + total - (cost.get(low) ?? 0) - 1),
 			filter,
 		);
 		expect(twoShort.evicted.map((item) => item.entry.sourceEntry.id)).toEqual([low, high]);

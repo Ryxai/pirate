@@ -71,8 +71,8 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateMessagesTokens,
 	estimateProjectedContextTokens,
-	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -132,6 +132,7 @@ import {
 	type SessionEntry,
 	SessionManager,
 	type SessionProjection,
+	toRequestOrder,
 } from "./session-manager.ts";
 import {
 	applyToolModifiers,
@@ -367,20 +368,22 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
-function estimateMessagesTokens(messages: AgentMessage[]): number {
-	let tokens = 0;
-	for (const message of messages) {
-		tokens += estimateTokens(message);
-	}
-	return tokens;
+function isBoundedEntry(entry: SessionEntry): boolean {
+	return (entry.type === "custom_message" || entry.type === "context_edit") && entry.visibility !== undefined;
 }
 
-/** Number of leading messages that are structurally equal in both lists. */
-function commonPrefixLength(a: AgentMessage[], b: AgentMessage[]): number {
+/**
+ * A sent request as one string per message, for comparing prefixes across requests. System
+ * messages compare by position only: the prompt and tool projections rewrite them after the
+ * `context` handlers ran.
+ */
+function toSentRequest(messages: AgentMessage[]): string[] {
+	return messages.map((message) => (message.role === "system" ? "system" : JSON.stringify(message)));
+}
+
+function commonPrefixLength(a: string[], b: string[]): number {
 	let length = 0;
-	while (length < a.length && length < b.length && JSON.stringify(a[length]) === JSON.stringify(b[length])) {
-		length++;
-	}
+	while (length < a.length && length < b.length && a[length] === b[length]) length++;
 	return length;
 }
 
@@ -418,8 +421,10 @@ export class AgentSession {
 	private _overflowRecoveryAttempted = false;
 	/** The request being prepared, for `context` handlers and the guards on their output. */
 	private _request: ExtensionRequest | undefined;
+	/** Whether the session holds a bounded contribution, so the finalized transcript needs refreshing at turn end. */
+	private _hasBoundedEntries: boolean;
 	/** Last transformed request per model, to detect handlers shortening the cached prefix. */
-	private _lastRequestByModel = new Map<string, AgentMessage[]>();
+	private _lastRequestByModel = new Map<string, string[]>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -502,6 +507,7 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		this._hasBoundedEntries = this.sessionManager.getEntries().some(isBoundedEntry);
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
@@ -787,7 +793,7 @@ export class AgentSession {
 		return shouldCompact(
 			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
 			model.contextWindow,
-			this.settingsManager.getCompactionSettings(this.model),
+			this.settingsManager.getCompactionSettings(model),
 		);
 	}
 
@@ -796,10 +802,10 @@ export class AgentSession {
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 		const model = this.model;
 		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
-			return { ...context, messages: projection.messages };
+			return { ...context, messages: toRequestOrder(projection.messages) };
 		}
 		await this._runAutoCompaction("threshold", false);
-		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
+		return { ...context, messages: toRequestOrder(this.sessionManager.buildSessionProjection().messages) };
 	}
 
 	private _installAgentRequestProjection(): void {
@@ -811,7 +817,7 @@ export class AgentSession {
 				const projection = this.sessionManager.buildSessionProjection();
 				const canonicalContext = {
 					...request.context,
-					messages: projection.messages,
+					messages: toRequestOrder(projection.messages),
 					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 					tools: this.agent.state.tools.slice(),
 				};
@@ -904,6 +910,8 @@ export class AgentSession {
 				});
 			}
 			this._reportShortenedCachePrefix(request.model, messages, transformed);
+			this._request = undefined;
+			this._extensionRunner.setRequest(undefined);
 			return transformed;
 		};
 	}
@@ -915,15 +923,15 @@ export class AgentSession {
 	): void {
 		const key = `${model.provider}/${model.id}`;
 		const previous = this._lastRequestByModel.get(key);
-		this._lastRequestByModel.set(key, transformed);
+		const sent = toSentRequest(transformed);
+		this._lastRequestByModel.set(key, sent);
 		if (!previous || model.cost.cacheRead <= 0 || !this.settingsManager.getShowCacheMissNotices()) return;
-		// Prompt and tool changes move the prefix on their own; only the conversation is compared.
-		const conversation = (messages: AgentMessage[]) => messages.filter((message) => message.role !== "system");
-		const cached = conversation(previous);
-		const withHandlers = commonPrefixLength(cached, conversation(transformed));
-		const withoutHandlers = commonPrefixLength(cached, conversation(canonical));
+		const withHandlers = commonPrefixLength(previous, sent);
+		const withoutHandlers = commonPrefixLength(previous, toSentRequest(canonical));
 		if (withHandlers >= withoutHandlers) return;
-		const lost = estimateMessagesTokens(cached.slice(withHandlers, withoutHandlers));
+		const lost = Math.ceil(
+			previous.slice(withHandlers, withoutHandlers).reduce((chars, json) => chars + json.length, 0) / 4,
+		);
 		this._extensionRunner.emitError({
 			extensionPath: "<context>",
 			event: "context",
@@ -1034,7 +1042,7 @@ export class AgentSession {
 		for (const entry of projection.entries) {
 			for (const message of entry.messages) this._entryIdsByMessage.set(message, entry.sourceEntry.id);
 		}
-		this.agent.state.messages = projection.messages;
+		this.agent.state.messages = toRequestOrder(projection.messages);
 	}
 
 	private _applyBoundaryDrafts(manager: SessionManager, drafts: SessionBoundaryDraft[]): SessionEntry[] {
@@ -1046,14 +1054,7 @@ export class AgentSession {
 					entryId = manager.appendCustomEntry(draft.customType, draft.data);
 					break;
 				case "custom_message":
-					entryId = manager.appendCustomMessageEntry(
-						draft.customType,
-						draft.content,
-						draft.display,
-						draft.details,
-						draft.visibility,
-						draft.position,
-					);
+					entryId = manager.appendCustomMessageEntry(draft);
 					break;
 				case "context_edit":
 					entryId = manager.appendContextEdit(draft.targetId, draft.replacement, draft.visibility);
@@ -1076,6 +1077,7 @@ export class AgentSession {
 			}
 			const entry = manager.getEntry(entryId);
 			if (entry) appended.push(entry);
+			if (entry && isBoundedEntry(entry)) this._hasBoundedEntries = true;
 		}
 		return appended;
 	}
@@ -1245,14 +1247,8 @@ export class AgentSession {
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
-				entryId = this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-					event.message.visibility,
-					event.message.position,
-				);
+				entryId = this.sessionManager.appendCustomMessageEntry(event.message);
+				if (event.message.visibility) this._hasBoundedEntries = true;
 			} else if (
 				event.message.role === "system" ||
 				event.message.role === "user" ||
@@ -1293,15 +1289,9 @@ export class AgentSession {
 		if (event.type === "turn_end") {
 			this._lastAssistantToolResults = event.toolResults;
 			this._flushPendingCustomMessages();
-			// The turn's assistant message may end an earlier bounded contribution; the finalized
-			// transcript drops it now, as the next request's projection will.
-			if (
-				this.sessionManager
-					.getBranch()
-					.some((entry) => (entry.type === "custom_message" || entry.type === "context_edit") && entry.visibility)
-			) {
-				this._refreshFinalizedContext();
-			}
+			// The turn's messages may have ended a bounded contribution; the finalized transcript
+			// drops it now, as the next request's projection will.
+			if (this._hasBoundedEntries) this._refreshFinalizedContext();
 		}
 	};
 
@@ -2037,6 +2027,8 @@ export class AgentSession {
 				content: msg.content ?? [],
 				display: msg.display,
 				details: msg.details,
+				...(msg.visibility ? { visibility: msg.visibility } : {}),
+				...(msg.position ? { position: msg.position } : {}),
 				timestamp: Date.now(),
 			});
 		}
@@ -2467,14 +2459,8 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
-		this.sessionManager.appendCustomMessageEntry(
-			appMessage.customType,
-			appMessage.content,
-			appMessage.display,
-			appMessage.details,
-			appMessage.visibility,
-			appMessage.position,
-		);
+		this.sessionManager.appendCustomMessageEntry(appMessage);
+		if (appMessage.visibility) this._hasBoundedEntries = true;
 		this._refreshFinalizedContext();
 		this._emit({ type: "message_start", message: appMessage });
 		this._emit({ type: "message_end", message: appMessage });

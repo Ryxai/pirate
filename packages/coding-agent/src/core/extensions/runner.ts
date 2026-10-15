@@ -2,7 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage, AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
@@ -13,7 +13,7 @@ import {
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
-import type { ContextBudget, ProjectedContext } from "../context-projection.ts";
+import type { ProjectedContext } from "../context-projection.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
@@ -55,6 +55,7 @@ import type {
 	ExtensionEvent,
 	ExtensionFlag,
 	ExtensionMode,
+	ExtensionRequest,
 	ExtensionRuntime,
 	ExtensionShortcut,
 	ExtensionToolContext,
@@ -224,13 +225,6 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
-/** The provider request being prepared, as `context` handlers see it. */
-export interface ExtensionRequest {
-	model: Model<any>;
-	thinkingLevel: ThinkingLevel;
-	budget: ContextBudget;
-}
-
 type BoundaryBaseEvent =
 	| Omit<TurnEndEvent, "entries" | "continue" | "context">
 	| Omit<AgentBeforeSettleEvent, "entries" | "continue" | "context">;
@@ -389,7 +383,7 @@ export class ExtensionRunner {
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private projectContextFn: (options: ProjectContextOptions) => ProjectedContext = () => {
-		throw new Error("Context projection is not available in this mode");
+		throw new Error("Context projection is not available");
 	};
 	private request: ExtensionRequest | undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};

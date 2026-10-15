@@ -40,15 +40,15 @@ export interface BashExecutionMessage {
 }
 
 /**
- * When a custom message leaves model context. Conditions are evaluated over the entries that
- * follow the message on the active branch, so they hold after resume and on every branch.
+ * When a bounded contribution leaves model context. Conditions are evaluated over the entries
+ * that follow it on the active branch, so they hold after resume and on every branch.
  * - `assistant_message`: sent with one request, dropped once the model has answered
  * - `user_message`: kept through the tool-call turns of the current run
  * - `compaction`: dropped at the next compaction, whether or not it keeps the entry
  * - `{ assistantMessages: n }`: dropped after the n-th assistant response
  * - `{ customType }`: dropped once a custom entry or custom message of that type follows
  */
-export type CustomMessageExpiry =
+export type ContextExpiry =
 	| "assistant_message"
 	| "user_message"
 	| "compaction"
@@ -56,11 +56,11 @@ export type CustomMessageExpiry =
 	| { customType: string };
 
 /**
- * Lifetime of a custom message in model context. A context edit appended after the expiry point
- * overrides it, so an expired message can be restored or edited later.
+ * Lifetime of a custom message, or of a context edit's contribution, in model context. A context
+ * edit keeps its target's visibility unless it carries its own; `{}` makes it permanent.
  */
-export interface CustomMessageVisibility {
-	until?: CustomMessageExpiry;
+export interface ContextVisibility {
+	until?: ContextExpiry;
 	/** A later custom message with the same key supersedes this one. */
 	key?: string;
 }
@@ -76,7 +76,7 @@ export interface CustomMessage<T = unknown> {
 	display: boolean;
 	details?: T;
 	/** Omitted: the message stays in model context like any other. */
-	visibility?: CustomMessageVisibility;
+	visibility?: ContextVisibility;
 	/** "tail" projects the message after every other message of the request, whatever its branch position. */
 	position?: "tail";
 	timestamp: number;
@@ -149,24 +149,23 @@ export function createCompactionSummaryMessage(
 	};
 }
 
+/** Fields of a custom message that callers supply; Pi adds the role and timestamp. */
+export type CustomMessageInput<T = unknown> = Pick<
+	CustomMessage<T>,
+	"customType" | "content" | "display" | "details" | "visibility" | "position"
+>;
+
 /** Convert CustomMessageEntry to AgentMessage format */
-export function createCustomMessage(
-	customType: string,
-	content: string | (TextContent | ImageContent)[],
-	display: boolean,
-	details: unknown | undefined,
-	timestamp: string,
-	visibility?: CustomMessageVisibility,
-	position?: "tail",
-): CustomMessage {
+export function createCustomMessage(message: CustomMessageInput, timestamp: string): CustomMessage {
 	return {
 		role: "custom",
-		customType,
-		content,
-		display,
-		details,
-		...(visibility ? { visibility } : {}),
-		...(position ? { position } : {}),
+		customType: message.customType,
+		// Session files are parsed without validation; old or hand-edited files can lack content.
+		content: message.content ?? [],
+		display: message.display,
+		details: message.details,
+		...(message.visibility ? { visibility: message.visibility } : {}),
+		...(message.position ? { position: message.position } : {}),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

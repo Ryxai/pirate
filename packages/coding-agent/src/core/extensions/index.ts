@@ -12,7 +12,6 @@ export {
 } from "./loader.ts";
 export type {
 	ExtensionErrorListener,
-	ExtensionRequest,
 	ForkHandler,
 	NavigateTreeHandler,
 	NewSessionHandler,
@@ -89,6 +88,7 @@ export type {
 	ExtensionFlag,
 	ExtensionHandler,
 	ExtensionMode,
+	ExtensionRequest,
 	// Runtime
 	ExtensionRuntime,
 	ExtensionShortcut,

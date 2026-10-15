@@ -291,7 +291,11 @@ describe("session context edits", () => {
 		const session = SessionManager.inMemory();
 		session.appendMessage({ role: "user", content: "old request", timestamp: Date.now() });
 		session.appendMessage(assistant("old answer"));
-		const instructionId = session.appendCustomMessageEntry("next-work", "UNSENT-INSTRUCTION ".repeat(100), false);
+		const instructionId = session.appendCustomMessageEntry({
+			customType: "next-work",
+			content: "UNSENT-INSTRUCTION ".repeat(100),
+			display: false,
+		});
 		session.appendCustomEntry("bookkeeping", { source: "test" });
 
 		const preparation = prepareCompaction(session.getBranch(), {
@@ -310,7 +314,11 @@ describe("session context edits", () => {
 			content: "unanswered input ".repeat(100),
 			timestamp: Date.now(),
 		});
-		const customId = session.appendCustomMessageEntry("temporary", "temporary context", false);
+		const customId = session.appendCustomMessageEntry({
+			customType: "temporary",
+			content: "temporary context",
+			display: false,
+		});
 		session.appendContextEdit(customId, null);
 
 		const preparation = prepareCompaction(session.getBranch(), {

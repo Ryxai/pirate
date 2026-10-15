@@ -50,6 +50,7 @@ export {
 	shouldCompact,
 } from "./core/compaction/index.ts";
 export {
+	CONTEXT_RECALL_TYPE,
 	type ContextBudget,
 	type ProjectedContext,
 	type ProjectionDecision,
@@ -227,7 +228,7 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
-export { type CustomMessageExpiry, type CustomMessageVisibility, convertToLlm } from "./core/messages.ts";
+export { type ContextExpiry, type ContextVisibility, type CustomMessageInput, convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
 	type ModelScopeDiagnostic,

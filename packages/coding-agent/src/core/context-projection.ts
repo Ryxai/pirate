@@ -8,7 +8,7 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import { estimateTokens } from "./compaction/compaction.ts";
+import { estimateMessagesTokens } from "./compaction/compaction.ts";
 import type { CustomMessage } from "./messages.ts";
 import {
 	type ProjectedSessionEntry,
@@ -73,10 +73,6 @@ interface Addition {
 	placement: "tail" | "in_place";
 }
 
-function sumTokens(messages: AgentMessage[]): number {
-	return messages.reduce((total, message) => total + estimateTokens(message), 0);
-}
-
 function contentBlocks(message: AgentMessage): (TextContent | ImageContent)[] {
 	switch (message.role) {
 		case "user":
@@ -135,16 +131,27 @@ export function projectContext(
 	let tokens = budget.baselineTokens;
 
 	projection.entries.forEach((entry, index) => {
+		// A superseded compaction summary is stale, not omitted; it is never offered to the filter.
+		if (entry.sourceEntry.type === "compaction") {
+			kept.push(entry.messages);
+			return;
+		}
 		const source = entry.messages.length === 0 ? sessionEntryToContextMessages(entry.sourceEntry) : entry.messages;
 		const omitted = entry.messages.length === 0 && source.length > 0;
-		const decision = filter?.(entry, { omitted, tokens: sumTokens(source) }) ?? "default";
+		const decision = filter?.(entry, { omitted, tokens: estimateMessagesTokens(source) }) ?? "default";
 		if (decision === "omit") {
-			tokens -= sumTokens(entry.messages);
+			tokens -= estimateMessagesTokens(entry.messages);
 			kept.push([]);
 			return;
 		}
 		if (decision === "default" || source.length === 0) {
-			kept.push(entry.messages);
+			// Canonical tail messages keep their request position after everything else.
+			if (entry.sourceEntry.type === "custom_message" && entry.sourceEntry.position === "tail") {
+				kept.push([]);
+				moved.push({ index, entry, messages: entry.messages, tokens: 0, priority: 0, placement: "tail" });
+			} else {
+				kept.push(entry.messages);
+			}
 			return;
 		}
 		const placement = decision.placement ?? (omitted ? "tail" : "in_place");
@@ -154,7 +161,7 @@ export function projectContext(
 			index,
 			entry,
 			messages,
-			tokens: sumTokens(messages),
+			tokens: estimateMessagesTokens(messages),
 			priority: decision.priority ?? 0,
 			placement,
 		};
@@ -165,6 +172,7 @@ export function projectContext(
 		} else if (placement === "tail") {
 			kept.push([]);
 			moved.push(addition);
+			tokens += addition.tokens - estimateMessagesTokens(entry.messages);
 		} else {
 			kept.push(entry.messages);
 		}
@@ -189,9 +197,11 @@ export function projectContext(
 	const tail = [...moved, ...additions.filter((addition) => addition.placement === "tail")]
 		.sort((a, b) => a.index - b.index)
 		.flatMap((addition) => addition.messages);
+	const ordered = [...kept.flat(), ...tail];
+	const messages = dropOrphanedToolResults(ordered);
 	return {
-		messages: dropOrphanedToolResults([...kept.flat(), ...tail]),
-		tokens,
+		messages,
+		tokens: tokens - estimateMessagesTokens(ordered) + estimateMessagesTokens(messages),
 		budget: fullBudget,
 		evicted,
 	};

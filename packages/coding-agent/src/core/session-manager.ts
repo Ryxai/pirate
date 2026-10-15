@@ -33,9 +33,10 @@ import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	type BashExecutionMessage,
+	type ContextExpiry,
+	type ContextVisibility,
 	type CustomMessage,
-	type CustomMessageExpiry,
-	type CustomMessageVisibility,
+	type CustomMessageInput,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
@@ -158,7 +159,7 @@ export interface SessionInfoEntry extends SessionEntryBase {
  * - false: hidden entirely
  * - true: rendered with distinct styling (different from user messages)
  *
- * visibility bounds the time in LLM context (see CustomMessageVisibility). Omitted = permanent.
+ * visibility bounds the time in LLM context (see ContextVisibility). Omitted = permanent.
  * position "tail" projects the message after every other message of the request.
  */
 export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
@@ -167,7 +168,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
-	visibility?: CustomMessageVisibility;
+	visibility?: ContextVisibility;
 	position?: "tail";
 }
 
@@ -184,8 +185,11 @@ export interface ContextEditEntry extends SessionEntryBase {
 	targetId: string;
 	/** Null omits the target from model context. A value replaces only its content. "source" restores it. */
 	replacement: { content: ContextEditableContent } | "source" | null;
-	/** Lifetime of this edit's contribution, counted from the edit (see CustomMessageVisibility). */
-	visibility?: CustomMessageVisibility;
+	/**
+	 * Lifetime of this edit's contribution, counted from the edit. Omitted keeps the target's own
+	 * visibility; `{}` makes the contribution permanent.
+	 */
+	visibility?: ContextVisibility;
 }
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
@@ -222,6 +226,7 @@ export interface ProjectedSessionEntry {
 	messages: AgentMessage[];
 }
 
+/** Model-visible contributions in branch order. Requests move tail messages last; see toRequestOrder(). */
 export interface SessionProjection {
 	entries: ProjectedSessionEntry[];
 	messages: AgentMessage[];
@@ -229,6 +234,7 @@ export interface SessionProjection {
 	model: { provider: string; modelId: string } | null;
 }
 
+/** The messages a request sends, in request order. */
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
@@ -459,19 +465,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		}
 		return [message];
 	}
-	if (entry.type === "custom_message") {
-		return [
-			createCustomMessage(
-				entry.customType,
-				entry.content ?? [],
-				entry.display,
-				entry.details,
-				entry.timestamp,
-				entry.visibility,
-				entry.position,
-			),
-		];
-	}
+	if (entry.type === "custom_message") return [createCustomMessage(entry, entry.timestamp)];
 	if (entry.type === "branch_summary" && entry.summary) {
 		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
 	}
@@ -559,12 +553,12 @@ function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undef
 /** A contribution with visibility, waiting for the entry that ends it. */
 interface PendingExpiry {
 	targetId: string;
-	visibility: CustomMessageVisibility;
+	visibility: ContextVisibility;
 	/** Assistant messages seen since the contribution started. */
 	assistantMessages: number;
 }
 
-function matchesExpiry(until: CustomMessageExpiry, entry: SessionEntry, assistantMessages: number): boolean {
+function matchesExpiry(until: ContextExpiry, entry: SessionEntry, assistantMessages: number): boolean {
 	const isAssistant = entry.type === "message" && entry.message.role === "assistant";
 	if (typeof until === "string") {
 		switch (until) {
@@ -589,9 +583,9 @@ function endsVisibility(pending: PendingExpiry, entry: SessionEntry): boolean {
 /**
  * Index on `path` of the entry that ends each bounded contribution, keyed by target entry id.
  * A custom message with visibility starts one; a context edit on a target replaces its pending
- * contribution and starts a new one when the edit carries visibility.
+ * contribution with one counted from the edit, under the edit's visibility or else the target's.
  */
-function findExpiries(path: SessionEntry[]): Map<string, number> {
+function findExpiries(path: SessionEntry[], byId: Map<string, SessionEntry>): Map<string, number> {
 	const expiries = new Map<string, number>();
 	let pending: PendingExpiry[] = [];
 	path.forEach((entry, index) => {
@@ -607,11 +601,18 @@ function findExpiries(path: SessionEntry[]): Map<string, number> {
 			pending.push({ targetId: entry.id, visibility: entry.visibility, assistantMessages: 0 });
 		} else if (entry.type === "context_edit") {
 			pending = pending.filter((item) => item.targetId !== entry.targetId);
-			if (entry.visibility)
-				pending.push({ targetId: entry.targetId, visibility: entry.visibility, assistantMessages: 0 });
+			const target = byId.get(entry.targetId);
+			const visibility = entry.visibility ?? (target?.type === "custom_message" ? target.visibility : undefined);
+			if (visibility) pending.push({ targetId: entry.targetId, visibility, assistantMessages: 0 });
 		}
 	});
 	return expiries;
+}
+
+/** Order projected messages as a request sends them: custom messages with `position: "tail"` last. */
+export function toRequestOrder(messages: AgentMessage[]): AgentMessage[] {
+	const isTail = (message: AgentMessage) => message.role === "custom" && message.position === "tail";
+	return [...messages.filter((message) => !isTail(message)), ...messages.filter(isTail)];
 }
 
 /** Build provenance-preserving, compaction-aware model context. */
@@ -628,7 +629,7 @@ export function buildSessionProjection(
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
 	const pathIndex = new Map(path.map((entry, index) => [entry.id, index]));
-	const expiries = findExpiries(path);
+	const expiries = findExpiries(path, buildEntryIndex(entries, byId));
 	const projectedEntries = contextEntries.map((sourceEntry, index): ProjectedSessionEntry => {
 		const edit = edits.get(sourceEntry.id);
 		const expiry = expiries.get(sourceEntry.id);
@@ -644,25 +645,22 @@ export function buildSessionProjection(
 				(sourceEntry.type === "compaction" && index > 0) || expired ? [] : projectContextEntry(sourceEntry, edit),
 		};
 	});
-	const isTail = (entry: ProjectedSessionEntry) =>
-		entry.sourceEntry.type === "custom_message" && entry.sourceEntry.position === "tail";
-	const ordered = [...projectedEntries.filter((entry) => !isTail(entry)), ...projectedEntries.filter(isTail)];
 	return {
-		entries: ordered,
-		messages: ordered.flatMap((entry) => entry.messages),
+		entries: projectedEntries,
+		messages: projectedEntries.flatMap((entry) => entry.messages),
 		thinkingLevel,
 		model,
 	};
 }
 
-/** Build the finalized model context from the canonical session projection. */
+/** Build the finalized model context, in request order, from the canonical session projection. */
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionContext {
 	const { messages, thinkingLevel, model } = buildSessionProjection(entries, leafId, byId);
-	return { messages, thinkingLevel, model };
+	return { messages: toRequestOrder(messages), thinkingLevel, model };
 }
 
 /**
@@ -1413,30 +1411,17 @@ export class SessionManager {
 
 	/**
 	 * Append a custom message entry (for extensions) that participates in LLM context.
-	 * @param customType Extension identifier for filtering on reload
-	 * @param content Message content (string or TextContent/ImageContent array)
-	 * @param display Whether to show in TUI (true = styled display, false = hidden)
-	 * @param details Optional extension-specific metadata (not sent to LLM)
-	 * @param visibility Optional lifetime in LLM context (see CustomMessageVisibility)
-	 * @param position "tail" projects the message after every other message of the request
-	 * @returns Entry id
+	 * See CustomMessageEntry for the fields. Returns the entry id.
 	 */
-	appendCustomMessageEntry<T = unknown>(
-		customType: string,
-		content: string | (TextContent | ImageContent)[],
-		display: boolean,
-		details?: T,
-		visibility?: CustomMessageVisibility,
-		position?: "tail",
-	): string {
+	appendCustomMessageEntry<T = unknown>(message: CustomMessageInput<T>): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
-			customType,
-			content,
-			display,
-			details,
-			...(visibility ? { visibility } : {}),
-			...(position ? { position } : {}),
+			customType: message.customType,
+			content: message.content,
+			display: message.display,
+			details: message.details,
+			...(message.visibility ? { visibility: message.visibility } : {}),
+			...(message.position ? { position: message.position } : {}),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -1448,12 +1433,12 @@ export class SessionManager {
 	/**
 	 * Append a branch-local edit to an earlier model-visible entry.
 	 * @param replacement Null omits the target, "source" restores its original content, a value replaces the content
-	 * @param visibility Optional lifetime of the edit's contribution, counted from the edit
+	 * @param visibility Lifetime of the edit's contribution, counted from the edit; omitted keeps the target's
 	 */
 	appendContextEdit(
 		targetId: string,
 		replacement: ContextEditEntry["replacement"],
-		visibility?: CustomMessageVisibility,
+		visibility?: ContextVisibility,
 	): string {
 		if (
 			replacement !== null &&
@@ -1595,8 +1580,7 @@ export class SessionManager {
 	}
 
 	buildSessionContext(): SessionContext {
-		const { messages, thinkingLevel, model } = this.buildSessionProjection();
-		return { messages, thinkingLevel, model };
+		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
 	}
 
 	/**

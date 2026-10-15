@@ -265,7 +265,7 @@ describe("custom message visibility in agent runs", () => {
 		expect(await run(false)).toEqual([]);
 		const reported = await run(true);
 		expect(reported.map((error) => error.extensionPath)).toEqual(["<context>"]);
-		expect(reported[0].error).toMatch(/from message 1 on/);
+		expect(reported[0].error).toMatch(/from message 2 on/);
 	});
 
 	it("does not report tail-only additions as a shortened prefix", async () => {
