@@ -5,6 +5,7 @@
 ### Added
 
 - Changing the thinking level mid-session on OpenAI GPT-6 models (API key) now keeps the prompt cache ([#10853](https://github.com/earendil-works/pi/issues/10853))
+- Added `visibility` to custom messages: `pi.sendMessage()` and `custom_message` boundary drafts accept `{ until: "assistant_message" | "user_message" | "compaction" }`, and the session projection omits the message once a matching entry follows it on the branch. See [Message visibility](docs/extensions.md#message-visibility)
 
 ### Fixed
 

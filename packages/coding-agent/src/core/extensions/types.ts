@@ -64,7 +64,7 @@ import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
-import type { CustomMessage } from "../messages.ts";
+import type { CustomMessage, CustomMessageVisibility } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type {
@@ -441,7 +441,7 @@ export interface ExtensionCommandContext extends ExtensionContext {
  */
 export interface ReplacedSessionContext extends ExtensionCommandContext {
 	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void>;
 
@@ -981,6 +981,8 @@ export interface CustomMessageEntryDraft {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: unknown;
+	/** Lifetime in model context; see `CustomMessageVisibility`. */
+	visibility?: CustomMessageVisibility;
 }
 
 export interface ContextEditEntryDraft {
@@ -1729,7 +1731,7 @@ export interface ExtensionAPI {
 
 	/** Send a custom message to the session. */
 	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void;
 
@@ -2101,7 +2103,7 @@ export interface ExtensionShortcut {
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 export type SendMessageHandler = <T = unknown>(
-	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility">,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 

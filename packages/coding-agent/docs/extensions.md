@@ -117,6 +117,24 @@ Handlers are awaited in stream order, so slow handlers delay stream consumption.
 
 `turn_end` and `agent_before_settle` are actionable boundaries. Their handlers can chain proposed `custom`, `custom_message`, `context_edit`, or `compaction` entries and return `continue: true` for one next model request. Guard continuation conditions because an unconditional continuation can loop. Use the exported event declarations for the complete validation and ordering contract.
 
+<a id="message-visibility"></a>
+
+A custom message normally stays in model context for the rest of the branch. `visibility` bounds that: the message is persisted like any other, but `buildSessionProjection()` omits it once an entry of the named kind follows it on the branch. `{ until: "assistant_message" }` sends the message with one request and drops it once the model has answered; `{ until: "user_message" }` keeps it through the tool-call turns of the current run; `{ until: "compaction" }` drops it at the next compaction. The condition is evaluated over session entries, so it holds after resume and on every branch. Use it for content that should steer one response without staying in the transcript, such as reasoning produced by another model before the main request:
+
+```typescript
+pi.on("before_agent_start", async (event, ctx) => {
+  const plan = await planWithHelperModel(ctx);
+  pi.sendMessage({
+    customType: "prelude",
+    content: `<prelude>${plan}</prelude>`,
+    display: false,
+    visibility: { until: "assistant_message" },
+  });
+});
+```
+
+An expired message changes the request prefix, so the next request after it expires misses the prompt cache once. Messages appended at the end of the transcript, as above, keep the cached prefix until then.
+
 <a id="cache_warming_decision"></a>
 
 `cache_warming_decision` can override an idle prompt-cache refresh with `{ action: "warm" }` or `{ action: "stop" }`. The last handler that returns an action wins.
@@ -231,6 +249,7 @@ Choose storage based on how state participates in the conversation:
 | Tool state that follows the active branch | Tool-result `details` |
 | Durable data excluded from model context | `pi.appendEntry()` |
 | Custom content stored and sent to the model | `pi.sendMessage()` |
+| Custom content sent to the model for a bounded time | `pi.sendMessage()` with [`visibility`](#message-visibility) |
 | Data outside one session | External storage |
 
 Reconstruct branch-sensitive state from `ctx.sessionManager.getBranch()` during `session_start`.

@@ -286,6 +286,7 @@ export {
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
+	type CustomMessageVisibility,
 	type FileEntry,
 	getLatestCompactionEntry,
 	type ModelChangeEntry,

@@ -185,6 +185,7 @@ Fields:
 - `content`: String or `(TextContent | ImageContent)[]` (same as UserMessage)
 - `display`: `true` = show in TUI with distinct styling, `false` = hidden
 - `details`: Optional extension-specific metadata (not sent to LLM)
+- `visibility`: Optional `{ until: "assistant_message" | "user_message" | "compaction" }`. The entry leaves model context once an entry of that kind follows it on the active branch. Omitted means it stays in context.
 
 ### LabelEntry
 
@@ -232,7 +233,7 @@ Entries normally form one tree, but navigation APIs can create multiple roots:
    - Includes entries after the compaction entry
 3. Preserves non-message entries in the selected range so interactive mode can render them
 
-`buildSessionProjection()` then applies the latest `context_edit` for each selected target. It returns the model-visible messages together with their source entries. Omitted targets produce no message; replacements retain the source entry's role and metadata while changing only content. The raw selected entries are not modified.
+`buildSessionProjection()` then applies the latest `context_edit` for each selected target and omits `custom_message` entries whose `visibility` has expired, i.e. a matching entry follows them on the path. It returns the model-visible messages together with their source entries. Omitted targets produce no message; replacements retain the source entry's role and metadata while changing only content. The raw selected entries are not modified.
 
 `buildSessionContext()` builds on that projection to produce the message list for the LLM:
 

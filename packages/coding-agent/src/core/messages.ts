@@ -40,6 +40,23 @@ export interface BashExecutionMessage {
 }
 
 /**
+ * Structural lifetime of a custom message's contribution to model context.
+ *
+ * The message leaves model context once an entry of the named kind follows it on the active
+ * session branch. The condition is evaluated over session entries, not at runtime, so it
+ * survives resume and branching and never depends on which process appended the message.
+ *
+ * - `assistant_message`: until the next assistant response, i.e. the message is sent with one
+ *   request and dropped once the model has answered it
+ * - `user_message`: until the next message the user writes, so it stays through tool-call turns
+ *   and extension messages of the same run
+ * - `compaction`: until the next compaction, whether or not the compaction would keep the entry
+ */
+export interface CustomMessageVisibility {
+	until: "assistant_message" | "user_message" | "compaction";
+}
+
+/**
  * Message type for extension-injected messages via sendMessage().
  * These are custom messages that extensions can inject into the conversation.
  */
@@ -49,6 +66,8 @@ export interface CustomMessage<T = unknown> {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
+	/** Lifetime in model context. Omitted means the message stays in context like any other. */
+	visibility?: CustomMessageVisibility;
 	timestamp: number;
 }
 
@@ -126,6 +145,7 @@ export function createCustomMessage(
 	display: boolean,
 	details: unknown | undefined,
 	timestamp: string,
+	visibility?: CustomMessageVisibility,
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -133,6 +153,7 @@ export function createCustomMessage(
 		content,
 		display,
 		details,
+		...(visibility ? { visibility } : {}),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

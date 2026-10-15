@@ -34,10 +34,13 @@ import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
+	type CustomMessageVisibility,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+
+export type { CustomMessageVisibility };
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
@@ -155,6 +158,8 @@ export interface SessionInfoEntry extends SessionEntryBase {
  * display controls TUI rendering:
  * - false: hidden entirely
  * - true: rendered with distinct styling (different from user messages)
+ *
+ * visibility bounds how long the message stays in model context; see CustomMessageVisibility.
  */
 export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	type: "custom_message";
@@ -162,6 +167,8 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
+	/** Lifetime in model context. Omitted means the message stays in context like any other entry. */
+	visibility?: CustomMessageVisibility;
 }
 
 /** Content that an append-only context edit may replace without changing message metadata. */
@@ -452,7 +459,14 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 	}
 	if (entry.type === "custom_message") {
 		return [
-			createCustomMessage(entry.customType, entry.content ?? [], entry.display, entry.details, entry.timestamp),
+			createCustomMessage(
+				entry.customType,
+				entry.content ?? [],
+				entry.display,
+				entry.details,
+				entry.timestamp,
+				entry.visibility,
+			),
 		];
 	}
 	if (entry.type === "branch_summary" && entry.summary) {
@@ -539,6 +553,39 @@ function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undef
 	});
 }
 
+function matchesVisibilityUntil(entry: SessionEntry, until: CustomMessageVisibility["until"]): boolean {
+	switch (until) {
+		case "assistant_message":
+			return entry.type === "message" && entry.message.role === "assistant";
+		case "user_message":
+			return entry.type === "message" && entry.message.role === "user";
+		case "compaction":
+			return entry.type === "compaction";
+	}
+}
+
+/**
+ * IDs of the custom messages on `path` whose visibility has ended. A message expires once an
+ * entry matching its `until` condition follows it on the branch, so a message appended after
+ * the last assistant response is still visible for the next request.
+ */
+function findExpiredCustomMessages(path: SessionEntry[]): Set<string> {
+	const expired = new Set<string>();
+	const pending: { id: string; until: CustomMessageVisibility["until"] }[] = [];
+	for (const entry of path) {
+		for (let i = pending.length - 1; i >= 0; i--) {
+			if (matchesVisibilityUntil(entry, pending[i].until)) {
+				expired.add(pending[i].id);
+				pending.splice(i, 1);
+			}
+		}
+		if (entry.type === "custom_message" && entry.visibility) {
+			pending.push({ id: entry.id, until: entry.visibility.until });
+		}
+	}
+	return expired;
+}
+
 /** Build provenance-preserving, compaction-aware model context. */
 export function buildSessionProjection(
 	entries: SessionEntry[],
@@ -552,6 +599,7 @@ export function buildSessionProjection(
 	for (const entry of contextEntries) {
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
+	const expired = findExpiredCustomMessages(path);
 	const projectedEntries = contextEntries.map(
 		(sourceEntry, index): ProjectedSessionEntry => ({
 			sourceEntry,
@@ -559,7 +607,7 @@ export function buildSessionProjection(
 			// raw ID lies inside the newest retained range. Only the newest compaction
 			// at index zero contributes a checkpoint and summary.
 			messages:
-				sourceEntry.type === "compaction" && index > 0
+				(sourceEntry.type === "compaction" && index > 0) || expired.has(sourceEntry.id)
 					? []
 					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
 		}),
@@ -1334,6 +1382,7 @@ export class SessionManager {
 	 * @param content Message content (string or TextContent/ImageContent array)
 	 * @param display Whether to show in TUI (true = styled display, false = hidden)
 	 * @param details Optional extension-specific metadata (not sent to LLM)
+	 * @param visibility Optional lifetime in model context; see CustomMessageVisibility
 	 * @returns Entry id
 	 */
 	appendCustomMessageEntry<T = unknown>(
@@ -1341,6 +1390,7 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		visibility?: CustomMessageVisibility,
 	): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
@@ -1348,6 +1398,7 @@ export class SessionManager {
 			content,
 			display,
 			details,
+			...(visibility ? { visibility } : {}),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),

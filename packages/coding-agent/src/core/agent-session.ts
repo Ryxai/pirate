@@ -958,6 +958,7 @@ export class AgentSession {
 						draft.content,
 						draft.display,
 						draft.details,
+						draft.visibility,
 					);
 					break;
 				case "context_edit":
@@ -1155,6 +1156,7 @@ export class AgentSession {
 					event.message.content,
 					event.message.display,
 					event.message.details,
+					event.message.visibility,
 				);
 			} else if (
 				event.message.role === "system" ||
@@ -1196,6 +1198,11 @@ export class AgentSession {
 		if (event.type === "turn_end") {
 			this._lastAssistantToolResults = event.toolResults;
 			this._flushPendingCustomMessages();
+			// The turn's messages may have ended the visibility of an earlier custom message.
+			// The finalized transcript drops it now, like the next request's projection will.
+			if (this.sessionManager.getBranch().some((entry) => entry.type === "custom_message" && entry.visibility)) {
+				this._refreshFinalizedContext();
+			}
 		}
 	};
 
@@ -2316,12 +2323,12 @@ export class AgentSession {
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
-	 * @param message Custom message with customType, content, display, details
+	 * @param message Custom message with customType, content, display, details, and optional visibility
 	 * @param options.triggerTurn If true and not streaming, triggers a new LLM turn
 	 * @param options.deliverAs Delivery mode: "steer", "followUp", or "nextTurn"
 	 */
 	async sendCustomMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		const appMessage = {
@@ -2331,6 +2338,7 @@ export class AgentSession {
 			content: message.content ?? [],
 			display: message.display,
 			details: message.details,
+			...(message.visibility ? { visibility: message.visibility } : {}),
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
@@ -2364,6 +2372,7 @@ export class AgentSession {
 			appMessage.content,
 			appMessage.display,
 			appMessage.details,
+			appMessage.visibility,
 		);
 		this._refreshFinalizedContext();
 		this._emit({ type: "message_start", message: appMessage });
