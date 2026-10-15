@@ -89,6 +89,7 @@ import {
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
 	type ExtensionMode,
+	type ExtensionRequest,
 	ExtensionRunner,
 	type ExtensionUIContext,
 	type InputSource,
@@ -374,6 +375,15 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+/** Number of leading messages that are structurally equal in both lists. */
+function commonPrefixLength(a: AgentMessage[], b: AgentMessage[]): number {
+	let length = 0;
+	while (length < a.length && length < b.length && JSON.stringify(a[length]) === JSON.stringify(b[length])) {
+		length++;
+	}
+	return length;
+}
+
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -406,8 +416,10 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
-	/** Budget of the request being prepared, for `context` handlers and the overage report. */
-	private _requestBudget: ContextBudget | undefined;
+	/** The request being prepared, for `context` handlers and the guards on their output. */
+	private _request: ExtensionRequest | undefined;
+	/** Last transformed request per model, to detect handlers shortening the cached prefix. */
+	private _lastRequestByModel = new Map<string, AgentMessage[]>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -522,7 +534,7 @@ export class AgentSession {
 		this._installAgentBoundaryHooks();
 		this._installHiddenDeclarationsProjection();
 		this._installAgentForcedPromptProjection();
-		this._installContextBudgetGuard();
+		this._installContextGuards();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -862,32 +874,61 @@ export class AgentSession {
 	}
 
 	private _setExtensionRequest(model: Model<any>, thinkingLevel: ThinkingLevel, projection: SessionProjection): void {
-		this._requestBudget = completeBudget(this._contextBudget(model, projection));
-		this._extensionRunner.setRequest({ model, thinkingLevel, budget: this._requestBudget });
+		this._request = { model, thinkingLevel, budget: completeBudget(this._contextBudget(model, projection)) };
+		this._extensionRunner.setRequest(this._request);
 	}
 
 	/**
-	 * Report a request that `context` handlers grew past the compaction threshold. The threshold
-	 * check ran on the canonical projection before the handlers, and compacting here would abort
-	 * the request, so it is sent as is; overflow recovery handles a rejection.
+	 * Guards on what `context` handlers made of the request. Both report through the extension
+	 * error channel and send the request as is.
+	 * - Growth past the compaction threshold: the check ran on the canonical projection before the
+	 *   handlers, and compacting here would abort the request; overflow recovery handles a rejection.
+	 * - A shortened prompt-cache prefix: the previous request to the same model cached a prefix that
+	 *   the canonical messages still share but the handlers changed. Reported only when cache miss
+	 *   notices are on and the model prices cache reads, so a user charged per token sees nothing.
 	 */
-	private _installContextBudgetGuard(): void {
+	private _installContextGuards(): void {
 		const previousTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
 			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
-			const budget = this._requestBudget;
-			if (!budget || budget.contextWindow <= 0) return transformed;
+			const request = this._request;
+			if (!request) return transformed;
+			const { budget } = request;
 			const threshold = budget.contextWindow - budget.reserveTokens;
 			const tokens = budget.baselineTokens + estimateMessagesTokens(transformed) - estimateMessagesTokens(messages);
-			if (tokens > threshold && budget.baselineTokens <= threshold) {
+			if (budget.contextWindow > 0 && tokens > threshold && budget.baselineTokens <= threshold) {
 				this._extensionRunner.emitError({
 					extensionPath: "<context>",
 					event: "context",
 					error: `context handlers grew the request to about ${tokens} tokens, past the compaction threshold of ${threshold}; sent as is`,
 				});
 			}
+			this._reportShortenedCachePrefix(request.model, messages, transformed);
 			return transformed;
 		};
+	}
+
+	private _reportShortenedCachePrefix(
+		model: Model<any>,
+		canonical: AgentMessage[],
+		transformed: AgentMessage[],
+	): void {
+		const key = `${model.provider}/${model.id}`;
+		const previous = this._lastRequestByModel.get(key);
+		this._lastRequestByModel.set(key, transformed);
+		if (!previous || model.cost.cacheRead <= 0 || !this.settingsManager.getShowCacheMissNotices()) return;
+		// Prompt and tool changes move the prefix on their own; only the conversation is compared.
+		const conversation = (messages: AgentMessage[]) => messages.filter((message) => message.role !== "system");
+		const cached = conversation(previous);
+		const withHandlers = commonPrefixLength(cached, conversation(transformed));
+		const withoutHandlers = commonPrefixLength(cached, conversation(canonical));
+		if (withHandlers >= withoutHandlers) return;
+		const lost = estimateMessagesTokens(cached.slice(withHandlers, withoutHandlers));
+		this._extensionRunner.emitError({
+			extensionPath: "<context>",
+			event: "context",
+			error: `context handlers changed the request from message ${withHandlers + 1} on; about ${lost} tokens the provider had cached are sent again`,
+		});
 	}
 
 	/** Project the branch into one model's copy of a request. See `projectContext()` in context-projection.ts. */

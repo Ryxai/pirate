@@ -153,7 +153,7 @@ pi.on("context", (event, ctx) => {
 });
 ```
 
-The compaction threshold is checked on the canonical projection before `context` handlers run, and compacting from a handler would abort the request. A handler that grows the request past the threshold is reported as an extension error and the request is sent as is; overflow recovery compacts if the provider rejects it. Right before compaction `budget.available` is zero or negative, so a filter that needs room should compact from `turn_end` instead. Each distinct copy is its own prompt-cache prefix: different models have separate caches, but two filters alternating on one model miss the cache on every request.
+The compaction threshold is checked on the canonical projection before `context` handlers run, and compacting from a handler would abort the request. A handler that grows the request past the threshold is reported as an extension error and the request is sent as is; overflow recovery compacts if the provider rejects it. Right before compaction `budget.available` is zero or negative, so a filter that needs room should compact from `turn_end` instead. Each distinct copy is its own prompt-cache prefix: different models have separate caches, but two filters alternating on one model miss the cache on every request. When `showCacheMissNotices` is on and the model prices cache reads, a handler that changes the request before the point the previous request to that model shared with the canonical messages is reported as an extension error with the tokens sent again.
 
 <a id="cache_warming_decision"></a>
 

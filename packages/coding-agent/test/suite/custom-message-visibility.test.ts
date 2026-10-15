@@ -233,4 +233,57 @@ describe("custom message visibility in agent runs", () => {
 		expect(harness.errors).toContainEqual(expect.objectContaining({ extensionPath: "<context>", event: "context" }));
 		expect(harness.errors[0].error).toMatch(/past the compaction threshold/);
 	});
+
+	it("reports a context handler that shortens the cached prefix, only when cache notices are on", async () => {
+		const run = async (showCacheMissNotices: boolean) => {
+			let turn = 0;
+			const harness = await createHarness({
+				models: [{ id: "cached", cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1 } }],
+				settings: { showCacheMissNotices },
+				extensionFactories: [
+					(pi) => {
+						pi.on("context", (event) => {
+							turn++;
+							// Every other request drops the first user message: a mid-context change.
+							return { messages: turn % 2 === 0 ? event.messages.slice(1) : event.messages };
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage("one"),
+				fauxAssistantMessage("two"),
+				fauxAssistantMessage("three"),
+			]);
+			await harness.session.prompt("first");
+			await harness.session.prompt("second");
+			await harness.session.prompt("third");
+			return harness.errors.filter((error) => error.error.includes("cached"));
+		};
+
+		expect(await run(false)).toEqual([]);
+		const reported = await run(true);
+		expect(reported.map((error) => error.extensionPath)).toEqual(["<context>"]);
+		expect(reported[0].error).toMatch(/from message 1 on/);
+	});
+
+	it("does not report tail-only additions as a shortened prefix", async () => {
+		const harness = await createHarness({
+			models: [{ id: "cached", cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1 } }],
+			settings: { showCacheMissNotices: true },
+			extensionFactories: [
+				(pi) => {
+					pi.on("context", (event) => ({
+						messages: [...event.messages, { role: "user", content: "reminder", timestamp: Date.now() }],
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("first");
+		await harness.session.prompt("second");
+		expect(harness.errors).toEqual([]);
+	});
 });
