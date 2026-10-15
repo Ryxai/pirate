@@ -89,6 +89,26 @@ describe("projectContext", () => {
 		expect(result.tokens).toBeGreaterThan(BUDGET.baselineTokens);
 	});
 
+	it("keeps a present entry in place unless asked to move it to the tail", () => {
+		const { manager } = session();
+		const projection = manager.buildSessionProjection();
+		const firstUser = projection.entries[0].sourceEntry.id;
+		const kept = projectContext(projection, BUDGET, (entry) =>
+			entry.sourceEntry.id === firstUser ? { include: true } : "default",
+		);
+		expect(kept.messages).toEqual(projection.messages);
+
+		const moved = projectContext(projection, BUDGET, (entry) =>
+			entry.sourceEntry.id === firstUser ? { include: true, placement: "tail" } : "default",
+		);
+		expect(roles(moved.messages)).toEqual(["assistant", "toolResult", "assistant", "user", "custom"]);
+		expect(moved.messages.at(-1)).toMatchObject({
+			customType: CONTEXT_RECALL_TYPE,
+			content: [{ type: "text", text: "request" }],
+		});
+		expect(moved.evicted).toEqual([]);
+	});
+
 	it("puts an omitted entry back in place when asked", () => {
 		const { manager, preludeId } = session();
 		const result = projectContext(manager.buildSessionProjection(), BUDGET, (entry) =>

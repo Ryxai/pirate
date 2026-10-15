@@ -31,9 +31,9 @@ export interface ContextBudget {
  * - `default`: the canonical contribution, so an omitted entry stays out
  * - `omit`: nothing
  * - include: the canonical contribution of a present entry, or the source content of an omitted
- *   one. `placement` "tail" (the default) re-sends the content after every other message as a
- *   custom message, which keeps the cached prefix and the tool-call order intact; "in_place"
- *   keeps the branch position
+ *   one. `placement` "tail" re-sends the content after every other message as a custom message,
+ *   which keeps the cached prefix and the tool-call order intact; "in_place" keeps the branch
+ *   position. Omitted entries default to "tail", present ones to "in_place"
  */
 export type ProjectionDecision =
 	| "default"
@@ -147,7 +147,7 @@ export function projectContext(
 			kept.push(entry.messages);
 			return;
 		}
-		const placement = decision.placement ?? "tail";
+		const placement = decision.placement ?? (omitted ? "tail" : "in_place");
 		const recalled = placement === "tail" ? recallMessage(entry, source) : undefined;
 		const messages = placement === "tail" ? (recalled ? [recalled] : []) : source;
 		const addition: Addition = {
