@@ -39,8 +39,6 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
-
-export type { CustomMessageVisibility };
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
@@ -159,7 +157,7 @@ export interface SessionInfoEntry extends SessionEntryBase {
  * - false: hidden entirely
  * - true: rendered with distinct styling (different from user messages)
  *
- * visibility bounds how long the message stays in model context; see CustomMessageVisibility.
+ * visibility bounds the time in LLM context (see CustomMessageVisibility). Omitted = permanent.
  */
 export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	type: "custom_message";
@@ -167,7 +165,6 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
-	/** Lifetime in model context. Omitted means the message stays in context like any other entry. */
 	visibility?: CustomMessageVisibility;
 }
 
@@ -564,11 +561,7 @@ function matchesVisibilityUntil(entry: SessionEntry, until: CustomMessageVisibil
 	}
 }
 
-/**
- * IDs of the custom messages on `path` whose visibility has ended. A message expires once an
- * entry matching its `until` condition follows it on the branch, so a message appended after
- * the last assistant response is still visible for the next request.
- */
+/** IDs of the custom messages on `path` that an entry matching their `until` condition follows. */
 function findExpiredCustomMessages(path: SessionEntry[]): Set<string> {
 	const expired = new Set<string>();
 	const pending: { id: string; until: CustomMessageVisibility["until"] }[] = [];
@@ -1382,7 +1375,7 @@ export class SessionManager {
 	 * @param content Message content (string or TextContent/ImageContent array)
 	 * @param display Whether to show in TUI (true = styled display, false = hidden)
 	 * @param details Optional extension-specific metadata (not sent to LLM)
-	 * @param visibility Optional lifetime in model context; see CustomMessageVisibility
+	 * @param visibility Optional lifetime in LLM context (see CustomMessageVisibility)
 	 * @returns Entry id
 	 */
 	appendCustomMessageEntry<T = unknown>(

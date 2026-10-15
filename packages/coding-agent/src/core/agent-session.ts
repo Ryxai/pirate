@@ -1198,8 +1198,8 @@ export class AgentSession {
 		if (event.type === "turn_end") {
 			this._lastAssistantToolResults = event.toolResults;
 			this._flushPendingCustomMessages();
-			// The turn's messages may have ended the visibility of an earlier custom message.
-			// The finalized transcript drops it now, like the next request's projection will.
+			// The turn's assistant message may end an earlier custom message's visibility; the
+			// finalized transcript drops it now, as the next request's projection will.
 			if (this.sessionManager.getBranch().some((entry) => entry.type === "custom_message" && entry.visibility)) {
 				this._refreshFinalizedContext();
 			}
@@ -2323,7 +2323,7 @@ export class AgentSession {
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
-	 * @param message Custom message with customType, content, display, details, and optional visibility
+	 * @param message Custom message with customType, content, display, details, visibility
 	 * @param options.triggerTurn If true and not streaming, triggers a new LLM turn
 	 * @param options.deliverAs Delivery mode: "steer", "followUp", or "nextTurn"
 	 */

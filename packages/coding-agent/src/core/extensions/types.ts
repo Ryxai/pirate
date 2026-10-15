@@ -981,7 +981,6 @@ export interface CustomMessageEntryDraft {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: unknown;
-	/** Lifetime in model context; see `CustomMessageVisibility`. */
 	visibility?: CustomMessageVisibility;
 }
 

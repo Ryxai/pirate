@@ -40,17 +40,12 @@ export interface BashExecutionMessage {
 }
 
 /**
- * Structural lifetime of a custom message's contribution to model context.
- *
- * The message leaves model context once an entry of the named kind follows it on the active
- * session branch. The condition is evaluated over session entries, not at runtime, so it
- * survives resume and branching and never depends on which process appended the message.
- *
- * - `assistant_message`: until the next assistant response, i.e. the message is sent with one
- *   request and dropped once the model has answered it
- * - `user_message`: until the next message the user writes, so it stays through tool-call turns
- *   and extension messages of the same run
- * - `compaction`: until the next compaction, whether or not the compaction would keep the entry
+ * Lifetime of a custom message in model context. The message is omitted from the projection
+ * once an entry of the named kind follows it on the active branch. The condition is evaluated
+ * over session entries, so it holds after resume and on every branch.
+ * - `assistant_message`: sent with one request, dropped once the model has answered
+ * - `user_message`: kept through the tool-call turns of the current run
+ * - `compaction`: dropped at the next compaction, whether or not it keeps the entry
  */
 export interface CustomMessageVisibility {
 	until: "assistant_message" | "user_message" | "compaction";
@@ -66,7 +61,7 @@ export interface CustomMessage<T = unknown> {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
-	/** Lifetime in model context. Omitted means the message stays in context like any other. */
+	/** Omitted: the message stays in model context like any other. */
 	visibility?: CustomMessageVisibility;
 	timestamp: number;
 }
