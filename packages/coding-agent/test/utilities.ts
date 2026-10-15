@@ -153,6 +153,20 @@ export function assistantMsg(text: string) {
 }
 
 /**
+ * Create a minimal tool result message for testing.
+ */
+export function toolResultMsg(toolCallId: string, text: string) {
+	return {
+		role: "toolResult" as const,
+		toolCallId,
+		toolName: "read",
+		content: [{ type: "text" as const, text }],
+		isError: false,
+		timestamp: Date.now(),
+	};
+}
+
+/**
  * Read a session JSONL file and return one label per record: the message role for
  * message entries, otherwise the entry type (e.g. "session", "model_change").
  */

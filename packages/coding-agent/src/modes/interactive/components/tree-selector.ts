@@ -12,7 +12,12 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { ContextEditEntry, SessionTreeNode } from "../../../core/session-manager.ts";
+import type {
+	ContextEditEntry,
+	CustomMessageEntry,
+	OmittedReason,
+	SessionTreeNode,
+} from "../../../core/session-manager.ts";
 import { formatReadLineRange } from "../../../core/tools/render-utils.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -124,6 +129,8 @@ class TreeList implements Component {
 	private visibleChildrenMap: Map<string | null, string[]> = new Map();
 	private lastSelectedId: string | null = null;
 	private foldedNodes: Set<string> = new Set();
+	/** Entries that contribute nothing on the current branch, by id (see buildSessionProjection). */
+	private omitted: ReadonlyMap<string, OmittedReason>;
 
 	public onSelect?: (entryId: string) => void;
 	public onCancel?: () => void;
@@ -136,9 +143,11 @@ class TreeList implements Component {
 		maxVisibleLines: number,
 		initialSelectedId?: string,
 		initialFilterMode?: FilterMode,
+		omitted: ReadonlyMap<string, OmittedReason> = new Map(),
 	) {
 		this.currentLeafId = currentLeafId;
 		this.maxVisibleLines = maxVisibleLines;
+		this.omitted = omitted;
 		this.filterMode = initialFilterMode ?? "default";
 		this.multipleRoots = tree.length > 1;
 		this.flatNodes = this.flattenTree(tree);
@@ -364,6 +373,7 @@ class TreeList implements Component {
 			const isSettingsEntry =
 				entry.type === "label" ||
 				entry.type === "context_edit" ||
+				entry.type === "annotation" ||
 				entry.type === "custom" ||
 				entry.type === "model_change" ||
 				entry.type === "thinking_level_change" ||
@@ -586,7 +596,7 @@ class TreeList implements Component {
 				break;
 			}
 			case "custom_message": {
-				parts.push(entry.customType);
+				parts.push(...this.customMessageMarks(entry), entry.customType);
 				if (typeof entry.content === "string") {
 					parts.push(entry.content);
 				} else {
@@ -616,12 +626,24 @@ class TreeList implements Component {
 			case "context_edit":
 				parts.push("context edit", contextEditLabel(entry), entry.targetId);
 				break;
+			case "annotation":
+				parts.push("annotation", entry.targetId);
+				break;
 			case "label":
 				parts.push("label", entry.label ?? "");
 				break;
 		}
 
 		return parts.join(" ");
+	}
+
+	/** `expired` or `superseded` when the message contributes nothing on the current branch; `recall -> id` when it re-sends an entry. */
+	private customMessageMarks(entry: CustomMessageEntry): string[] {
+		const marks: string[] = [];
+		const reason = this.omitted.get(entry.id);
+		if (reason === "expired" || reason === "superseded") marks.push(reason);
+		if (typeof entry.ref === "string") marks.push(`recall -> ${entry.ref}`);
+		return marks;
 	}
 
 	invalidate(): void {}
@@ -826,7 +848,10 @@ class TreeList implements Component {
 								.filter((c): c is { type: "text"; text: string } => c.type === "text")
 								.map((c) => c.text)
 								.join("");
-				result = theme.fg("customMessageLabel", `[${entry.customType}]: `) + normalize(content);
+				const marks = this.customMessageMarks(entry)
+					.map((mark) => theme.fg("dim", `[${mark}] `))
+					.join("");
+				result = marks + theme.fg("customMessageLabel", `[${entry.customType}]: `) + normalize(content);
 				break;
 			}
 			case "compaction": {
@@ -848,6 +873,9 @@ class TreeList implements Component {
 				break;
 			case "context_edit":
 				result = theme.fg("dim", `[context ${contextEditLabel(entry)}: ${entry.targetId}]`);
+				break;
+			case "annotation":
+				result = theme.fg("dim", `[annotation: ${entry.targetId}]`);
 				break;
 			case "label":
 				result = theme.fg("dim", `[label: ${entry.label ?? "(cleared)"}]`);
@@ -1360,13 +1388,14 @@ export class TreeSelectorComponent extends Container implements Focusable {
 		onLabelChange?: (entryId: string, label: string | undefined) => void,
 		initialSelectedId?: string,
 		initialFilterMode?: FilterMode,
+		omitted?: ReadonlyMap<string, OmittedReason>,
 	) {
 		super();
 
 		this.onLabelChangeCallback = onLabelChange;
 		const maxVisibleLines = Math.max(5, Math.floor(terminalHeight / 2));
 
-		this.treeList = new TreeList(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode);
+		this.treeList = new TreeList(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode, omitted);
 		this.treeList.onSelect = onSelect;
 		this.treeList.onCancel = onCancel;
 		this.treeList.onCopy = (text) => this.onCopy?.(text);

@@ -193,6 +193,86 @@ describe("TreeSelectorComponent", () => {
 			expect(rendered).toContain("[context omit: asst-1]");
 		});
 
+		test("hides annotations by default and labels them in all mode", () => {
+			const entries: SessionEntry[] = [
+				userMessage("user-1", null, "hello"),
+				assistantMessage("asst-1", "user-1", "hi"),
+				{
+					type: "annotation",
+					id: "ann-1",
+					parentId: "asst-1",
+					timestamp: new Date().toISOString(),
+					targetId: "asst-1",
+					fields: { "ext/mood@1": "calm" },
+				},
+			];
+			const tree = buildTree(entries);
+			const defaultSelector = new TreeSelectorComponent(
+				tree,
+				"ann-1",
+				24,
+				() => {},
+				() => {},
+			);
+			expect(defaultSelector.getTreeList().getSelectedNode()?.entry.id).toBe("asst-1");
+
+			const allSelector = new TreeSelectorComponent(
+				tree,
+				"ann-1",
+				24,
+				() => {},
+				() => {},
+				undefined,
+				undefined,
+				"all",
+			);
+			const rendered = allSelector.getTreeList().render(200).map(stripVTControlCharacters).join("\n");
+			expect(rendered).toContain("[annotation: asst-1]");
+		});
+
+		test("labels expired, superseded and recalled custom messages", () => {
+			const note = (id: string, parentId: string, text: string, ref?: string): SessionEntry => ({
+				type: "custom_message",
+				id,
+				parentId,
+				timestamp: new Date().toISOString(),
+				customType: "note",
+				content: text,
+				display: true,
+				...(ref ? { ref } : {}),
+			});
+			const entries: SessionEntry[] = [
+				userMessage("user-1", null, "hello"),
+				note("note-1", "user-1", "first"),
+				note("note-2", "note-1", "second"),
+				note("note-3", "note-2", "third", "user-1"),
+			];
+			const selector = new TreeSelectorComponent(
+				buildTree(entries),
+				"note-3",
+				24,
+				() => {},
+				() => {},
+				undefined,
+				undefined,
+				undefined,
+				new Map([
+					["note-1", "expired"],
+					["note-2", "superseded"],
+				]),
+			);
+			const list = selector.getTreeList();
+			const rendered = list.render(200).map(stripVTControlCharacters).join("\n");
+			expect(rendered).toContain("[expired] [note]: first");
+			expect(rendered).toContain("[superseded] [note]: second");
+			expect(rendered).toContain("[recall -> user-1] [note]: third");
+
+			// The marks are searchable
+			for (const char of "superseded") selector.handleInput(char);
+			expect(list.getSelectedNode()?.entry.id).toBe("note-2");
+			expect(list.render(200).map(stripVTControlCharacters).join("\n")).toContain("(1/1)");
+		});
+
 		test("focuses nearest visible ancestor when currentLeafId is a thinking_level_change entry", () => {
 			// Similar structure with thinking_level_change instead of model_change
 			const entries = [

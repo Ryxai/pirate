@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, JsonValue, Message, TextContent } from "@earendil-works/pi-ai";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -39,6 +39,34 @@ export interface BashExecutionMessage {
 	excludeFromContext?: boolean;
 }
 
+/** Key of an extension-owned field: "<namespace>/<name>@<version>". */
+export type FieldKey = string;
+
+export function fieldKey(namespace: string, name: string, version: number): FieldKey {
+	return `${namespace}/${name}@${version}`;
+}
+
+/** An entry or message that can carry extension-owned fields. */
+export interface FieldHolder {
+	fields?: Record<FieldKey, JsonValue>;
+}
+
+/** Read one extension-owned field of an entry or message. */
+export function getField<T extends JsonValue>(holder: FieldHolder, key: FieldKey): T | undefined {
+	return holder.fields?.[key] as T | undefined;
+}
+
+/** Keys of the fields present on an entry or message, all of them or those of one namespace. */
+export function listFields(holder: FieldHolder, namespace?: string): FieldKey[] {
+	const keys = Object.keys(holder.fields ?? {});
+	return namespace === undefined ? keys : keys.filter((key) => key.startsWith(`${namespace}/`));
+}
+
+/** Session files are parsed without validation: only a plain object counts as a `fields` record. */
+export function isFieldRecord(value: unknown): value is Record<FieldKey, JsonValue> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
  * When a bounded contribution leaves model context. Conditions are evaluated over the entries
  * that follow it on the active branch, so they hold after resume and on every branch.
@@ -47,13 +75,15 @@ export interface BashExecutionMessage {
  * - `compaction`: dropped at the next compaction, whether or not it keeps the entry
  * - `{ assistantMessages: n }`: dropped after the n-th assistant response
  * - `{ customType }`: dropped once a custom entry or custom message of that type follows
+ * - `{ tokens: n }`: dropped once the estimated tokens of the entries that followed exceed n
  */
 export type ContextExpiry =
 	| "assistant_message"
 	| "user_message"
 	| "compaction"
 	| { assistantMessages: number }
-	| { customType: string };
+	| { customType: string }
+	| { tokens: number };
 
 /**
  * Lifetime of a custom message, or of a context edit's contribution, in model context. A context
@@ -79,6 +109,15 @@ export interface CustomMessage<T = unknown> {
 	visibility?: ContextVisibility;
 	/** "tail" projects the message after every other message of the request, whatever its branch position. */
 	position?: "tail";
+	/** Eviction order under pressure; omitted means conversation, never evicted. */
+	priority?: number;
+	/**
+	 * Entry this message re-sends; content was copied from it when appended. The input type still
+	 * requires `content`, which is ignored when `ref` is set.
+	 */
+	ref?: string;
+	/** Extension-owned values by FieldKey. Pi never interprets them. */
+	fields?: Record<FieldKey, JsonValue>;
 	timestamp: number;
 }
 
@@ -152,8 +191,24 @@ export function createCompactionSummaryMessage(
 /** Fields of a custom message that callers supply; Pi adds the role and timestamp. */
 export type CustomMessageInput<T = unknown> = Pick<
 	CustomMessage<T>,
-	"customType" | "content" | "display" | "details" | "visibility" | "position"
+	"customType" | "content" | "display" | "details" | "visibility" | "position" | "priority" | "ref" | "fields"
 >;
+
+/**
+ * The projection fields of a custom message input that are set and well-formed. Session files and
+ * untyped extensions can hold malformed values; the entry and the message of one send agree on them.
+ */
+export function customMessageOptions(
+	message: CustomMessageInput,
+): Pick<CustomMessage, "visibility" | "position" | "priority" | "ref" | "fields"> {
+	return {
+		...(message.visibility ? { visibility: message.visibility } : {}),
+		...(message.position ? { position: message.position } : {}),
+		...(typeof message.priority === "number" ? { priority: message.priority } : {}),
+		...(typeof message.ref === "string" ? { ref: message.ref } : {}),
+		...(isFieldRecord(message.fields) ? { fields: message.fields } : {}),
+	};
+}
 
 /** Convert CustomMessageEntry to AgentMessage format */
 export function createCustomMessage(message: CustomMessageInput, timestamp: string): CustomMessage {
@@ -164,8 +219,7 @@ export function createCustomMessage(message: CustomMessageInput, timestamp: stri
 		content: message.content ?? [],
 		display: message.display,
 		details: message.details,
-		...(message.visibility ? { visibility: message.visibility } : {}),
-		...(message.position ? { position: message.position } : {}),
+		...customMessageOptions(message),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

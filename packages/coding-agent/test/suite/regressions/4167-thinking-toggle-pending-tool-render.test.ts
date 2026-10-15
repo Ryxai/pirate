@@ -53,6 +53,7 @@ type RenderSessionContextThis = {
 	maybeShowAssistantDiagnostics(message: AssistantMessage): void;
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void;
 	renderSessionItems: RenderSessionItems;
+	refreshCustomMessageMarkers(): void;
 };
 
 type RenderSessionEntries = (
@@ -88,6 +89,7 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		addMessageToChat(message: AgentMessage) {
 			chatContainer.addChild(new Text(message.role, 0, 0));
 		},
+		refreshCustomMessageMarkers: vi.fn(),
 	};
 }
 

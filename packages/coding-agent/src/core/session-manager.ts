@@ -3,6 +3,7 @@ import {
 	type AssistantMessage,
 	getCurrentSystemMessage,
 	type ImageContent,
+	type JsonValue,
 	type Message,
 	type SystemMessage,
 	type TextContent,
@@ -31,6 +32,7 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { estimateMessagesTokens } from "./compaction/compaction.ts";
 import {
 	type BashExecutionMessage,
 	type ContextExpiry,
@@ -40,6 +42,9 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	customMessageOptions,
+	type FieldKey,
+	isFieldRecord,
 } from "./messages.ts";
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -132,6 +137,8 @@ export interface CustomEntry<T = unknown> extends SessionEntryBase {
 	type: "custom";
 	customType: string;
 	data?: T;
+	/** Extension-owned values by FieldKey, for other code to read. Pi never interprets them. */
+	fields?: Record<FieldKey, JsonValue>;
 }
 
 /** Label entry for user-defined bookmarks/markers on entries. */
@@ -170,6 +177,12 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	display: boolean;
 	visibility?: ContextVisibility;
 	position?: "tail";
+	/** Eviction order under pressure; omitted means conversation, never evicted. */
+	priority?: number;
+	/** Entry this message re-sends; content was copied from it when appended. */
+	ref?: string;
+	/** Extension-owned values by FieldKey. Pi never interprets them. */
+	fields?: Record<FieldKey, JsonValue>;
 }
 
 /** Content that an append-only context edit may replace without changing message metadata. */
@@ -190,6 +203,15 @@ export interface ContextEditEntry extends SessionEntryBase {
 	 * visibility; `{}` makes the contribution permanent.
 	 */
 	visibility?: ContextVisibility;
+	/** Priority of the edit's contribution; wins over the target's own. */
+	priority?: number;
+}
+
+/** Branch-local, append-only values attached to another entry. Latest value per (targetId, key) wins; null clears. */
+export interface AnnotationEntry extends SessionEntryBase {
+	type: "annotation";
+	targetId: string;
+	fields: Record<FieldKey, JsonValue | null>;
 }
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
@@ -203,6 +225,7 @@ export type SessionEntry =
 	| CustomEntry
 	| CustomMessageEntry
 	| ContextEditEntry
+	| AnnotationEntry
 	| LabelEntry
 	| SessionInfoEntry;
 
@@ -219,11 +242,18 @@ export interface SessionTreeNode {
 	labelTimestamp?: string;
 }
 
+/** Why an entry with content contributes nothing: a null edit, an ended lifetime, or a later message with its key. */
+export type OmittedReason = "edit" | "expired" | "superseded";
+
 export interface ProjectedSessionEntry {
 	/** Raw append-only entry that owns this projected contribution. */
 	sourceEntry: SessionEntry;
 	/** Model-visible messages after context edits. Empty for state-only entries and omissions. */
 	messages: AgentMessage[];
+	/** Set when the source has content but `messages` is empty. Stale older compaction summaries get none. */
+	omitted?: OmittedReason;
+	/** Resolved priority: the latest edit's, else the entry's own. */
+	priority?: number;
 }
 
 /** Model-visible contributions in branch order. Requests move tail messages last; see toRequestOrder(). */
@@ -232,6 +262,8 @@ export interface SessionProjection {
 	messages: AgentMessage[];
 	thinkingLevel: string;
 	model: { provider: string; modelId: string } | null;
+	/** Resolved annotations by target entry id, over the whole branch. */
+	annotations: Map<string, Record<FieldKey, JsonValue>>;
 }
 
 /** The messages a request sends, in request order. */
@@ -267,6 +299,7 @@ export type ReadonlySessionManager = Pick<
 	| "getLeafEntry"
 	| "getEntry"
 	| "getLabel"
+	| "getAnnotations"
 	| "getBranch"
 	| "buildContextEntries"
 	| "buildSessionProjection"
@@ -556,9 +589,18 @@ interface PendingExpiry {
 	visibility: ContextVisibility;
 	/** Assistant messages seen since the contribution started. */
 	assistantMessages: number;
+	/** Estimated tokens of the entries seen since the contribution started. */
+	tokens: number;
 }
 
-function matchesExpiry(until: ContextExpiry, entry: SessionEntry, assistantMessages: number): boolean {
+/** Where and why a bounded contribution ends. */
+interface Expiry {
+	/** Index on the path of the entry that ends it. */
+	index: number;
+	reason: "expired" | "superseded";
+}
+
+function matchesExpiry(until: ContextExpiry, entry: SessionEntry, pending: PendingExpiry): boolean {
 	const isAssistant = entry.type === "message" && entry.message.role === "assistant";
 	if (typeof until === "string") {
 		switch (until) {
@@ -570,43 +612,121 @@ function matchesExpiry(until: ContextExpiry, entry: SessionEntry, assistantMessa
 				return entry.type === "compaction";
 		}
 	}
-	if ("assistantMessages" in until) return isAssistant && assistantMessages >= until.assistantMessages;
+	// Session files are parsed without validation; an unknown lifetime never ends.
+	if (typeof until !== "object" || until === null) return false;
+	if ("assistantMessages" in until) return isAssistant && pending.assistantMessages >= until.assistantMessages;
+	if ("tokens" in until) return pending.tokens > until.tokens;
 	return (entry.type === "custom" || entry.type === "custom_message") && entry.customType === until.customType;
 }
 
-function endsVisibility(pending: PendingExpiry, entry: SessionEntry): boolean {
+function endsVisibility(pending: PendingExpiry, entry: SessionEntry): Expiry["reason"] | undefined {
 	const { until, key } = pending.visibility;
-	if (key !== undefined && entry.type === "custom_message" && entry.visibility?.key === key) return true;
-	return until !== undefined && matchesExpiry(until, entry, pending.assistantMessages);
+	if (key !== undefined && entry.type === "custom_message" && entry.visibility?.key === key) return "superseded";
+	if (until !== undefined && matchesExpiry(until, entry, pending)) return "expired";
+	return undefined;
+}
+
+function hasTokenLifetime(pending: PendingExpiry): boolean {
+	const until = pending.visibility.until;
+	return typeof until === "object" && until !== null && "tokens" in until;
 }
 
 /**
- * Index on `path` of the entry that ends each bounded contribution, keyed by target entry id.
+ * The entry on `path` that ends each bounded contribution, keyed by target entry id.
  * A custom message with visibility starts one; a context edit on a target replaces its pending
  * contribution with one counted from the edit, under the edit's visibility or else the target's.
  */
-function findExpiries(path: SessionEntry[], byId: Map<string, SessionEntry>): Map<string, number> {
-	const expiries = new Map<string, number>();
+function findExpiries(path: SessionEntry[], byId: Map<string, SessionEntry>): Map<string, Expiry> {
+	const expiries = new Map<string, Expiry>();
 	let pending: PendingExpiry[] = [];
 	path.forEach((entry, index) => {
 		const isAssistant = entry.type === "message" && entry.message.role === "assistant";
+		// Token lifetimes count the raw content of every following entry; estimate it only while one is pending.
+		const tokens = pending.some(hasTokenLifetime) ? estimateMessagesTokens(sessionEntryToContextMessages(entry)) : 0;
 		for (let i = pending.length - 1; i >= 0; i--) {
 			if (isAssistant) pending[i].assistantMessages++;
-			if (endsVisibility(pending[i], entry)) {
-				expiries.set(pending[i].targetId, index);
+			pending[i].tokens += tokens;
+			const reason = endsVisibility(pending[i], entry);
+			if (reason) {
+				expiries.set(pending[i].targetId, { index, reason });
 				pending.splice(i, 1);
 			}
 		}
 		if (entry.type === "custom_message" && entry.visibility) {
-			pending.push({ targetId: entry.id, visibility: entry.visibility, assistantMessages: 0 });
+			pending.push({ targetId: entry.id, visibility: entry.visibility, assistantMessages: 0, tokens: 0 });
 		} else if (entry.type === "context_edit") {
 			pending = pending.filter((item) => item.targetId !== entry.targetId);
+			// A null edit omits the target; nothing is left to expire.
+			if (entry.replacement === null) return;
 			const target = byId.get(entry.targetId);
 			const visibility = entry.visibility ?? (target?.type === "custom_message" ? target.visibility : undefined);
-			if (visibility) pending.push({ targetId: entry.targetId, visibility, assistantMessages: 0 });
+			if (visibility) pending.push({ targetId: entry.targetId, visibility, assistantMessages: 0, tokens: 0 });
 		}
 	});
 	return expiries;
+}
+
+/** Entries that contribute messages to model context. */
+function hasContent(entry: SessionEntry): boolean {
+	return (
+		entry.type === "message" ||
+		entry.type === "custom_message" ||
+		entry.type === "compaction" ||
+		entry.type === "branch_summary"
+	);
+}
+
+/**
+ * Copy of the content a custom message re-sends when it refers to `entry`: the text and images of
+ * a user or custom message, the text of an assistant message, a tool result, or a summary.
+ * Undefined for entries without model content.
+ */
+function modelContent(entry: SessionEntry): CustomMessageEntry["content"] | undefined {
+	switch (entry.type) {
+		case "message": {
+			const message = entry.message;
+			// Session files are parsed without validation; old or hand-edited files can lack content.
+			if (message.role === "user" || message.role === "toolResult") {
+				return typeof message.content === "string" ? message.content : [...(message.content ?? [])];
+			}
+			if (message.role === "assistant") {
+				return (message.content ?? []).filter((block): block is TextContent => block.type === "text");
+			}
+			return undefined;
+		}
+		case "custom_message":
+			return typeof entry.content === "string" ? entry.content : [...(entry.content ?? [])];
+		case "compaction":
+		case "branch_summary":
+			return entry.summary;
+		default:
+			return undefined;
+	}
+}
+
+/** Resolved priority: the latest edit's, else the entry's own. Hand-edited files may hold non-numbers. */
+function resolvePriority(entry: SessionEntry, edit: ContextEditEntry | undefined): number | undefined {
+	if (typeof edit?.priority === "number") return edit.priority;
+	return entry.type === "custom_message" && typeof entry.priority === "number" ? entry.priority : undefined;
+}
+
+/**
+ * Annotations over `path`: the latest value per (targetId, key) wins and null clears. Entries with a
+ * malformed target or fields are skipped, as session files are parsed without validation.
+ */
+function resolveAnnotations(path: SessionEntry[]): Map<string, Record<FieldKey, JsonValue>> {
+	const annotations = new Map<string, Map<FieldKey, JsonValue>>();
+	for (const entry of path) {
+		if (entry.type !== "annotation" || typeof entry.targetId !== "string" || !isFieldRecord(entry.fields)) continue;
+		const resolved = annotations.get(entry.targetId) ?? new Map<FieldKey, JsonValue>();
+		for (const [key, value] of Object.entries(entry.fields)) {
+			if (value === null) resolved.delete(key);
+			else resolved.set(key, value);
+		}
+		if (resolved.size > 0) annotations.set(entry.targetId, resolved);
+		else annotations.delete(entry.targetId);
+	}
+	return new Map([...annotations].map(([targetId, fields]) => [targetId, Object.fromEntries(fields)]));
 }
 
 /** Order projected messages as a request sends them: custom messages with `position: "tail"` last. */
@@ -635,14 +755,20 @@ export function buildSessionProjection(
 		const expiry = expiries.get(sourceEntry.id);
 		// An expiry is an implicit omission at the ending entry; an edit appended later overrides it.
 		// An edit with its own visibility expires after itself, so the comparison keeps it omitted.
-		const expired = expiry !== undefined && (edit === undefined || (pathIndex.get(edit.id) ?? -1) < expiry);
+		const expired = expiry !== undefined && (edit === undefined || (pathIndex.get(edit.id) ?? -1) < expiry.index);
+		// buildContextEntries() may retain an older compaction entry because its
+		// raw ID lies inside the newest retained range. Only the newest compaction
+		// at index zero contributes a checkpoint and summary; older ones are stale, not omitted.
+		const stale = sourceEntry.type === "compaction" && index > 0;
+		// A null edit is the latest decision on the branch, so it names the reason over an expiry.
+		const omitted: OmittedReason | undefined =
+			edit?.replacement === null ? "edit" : expired ? expiry?.reason : undefined;
+		const priority = resolvePriority(sourceEntry, edit);
 		return {
 			sourceEntry,
-			// buildContextEntries() may retain an older compaction entry because its
-			// raw ID lies inside the newest retained range. Only the newest compaction
-			// at index zero contributes a checkpoint and summary.
-			messages:
-				(sourceEntry.type === "compaction" && index > 0) || expired ? [] : projectContextEntry(sourceEntry, edit),
+			messages: stale || expired ? [] : projectContextEntry(sourceEntry, edit),
+			...(omitted !== undefined && !stale && hasContent(sourceEntry) ? { omitted } : {}),
+			...(priority !== undefined ? { priority } : {}),
 		};
 	});
 	return {
@@ -650,6 +776,7 @@ export function buildSessionProjection(
 		messages: projectedEntries.flatMap((entry) => entry.messages),
 		thinkingLevel,
 		model,
+		annotations: resolveAnnotations(path),
 	};
 }
 
@@ -1368,11 +1495,12 @@ export class SessionManager {
 	}
 
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
-	appendCustomEntry(customType: string, data?: unknown): string {
+	appendCustomEntry(customType: string, data?: unknown, fields?: Record<FieldKey, JsonValue>): string {
 		const entry: CustomEntry = {
 			type: "custom",
 			customType,
 			data,
+			...(fields ? { fields } : {}),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -1411,17 +1539,17 @@ export class SessionManager {
 
 	/**
 	 * Append a custom message entry (for extensions) that participates in LLM context.
-	 * See CustomMessageEntry for the fields. Returns the entry id.
+	 * See CustomMessageEntry for the fields. With `ref`, the content is copied from that entry
+	 * instead of `content` (see copyRefContent). Returns the entry id.
 	 */
 	appendCustomMessageEntry<T = unknown>(message: CustomMessageInput<T>): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
 			customType: message.customType,
-			content: message.content,
+			content: message.ref === undefined ? message.content : this.copyRefContent(message.ref),
 			display: message.display,
 			details: message.details,
-			...(message.visibility ? { visibility: message.visibility } : {}),
-			...(message.position ? { position: message.position } : {}),
+			...customMessageOptions(message),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -1431,14 +1559,38 @@ export class SessionManager {
 	}
 
 	/**
+	 * Model content of the entry a custom message re-sends: text and images, text of assistant
+	 * messages, summaries. Throws when the entry does not exist or carries no model content, such
+	 * as an assistant message of tool calls only.
+	 */
+	copyRefContent(ref: string): CustomMessageEntry["content"] {
+		const entry = this.byId.get(ref);
+		if (!entry) throw new Error(`Entry ${ref} not found`);
+		const content = modelContent(entry);
+		if (content === undefined || content.length === 0) throw new Error(`Entry ${ref} does not carry model content`);
+		return content;
+	}
+
+	/** The entry, if it exists and is on the active branch; throws otherwise. */
+	private _requireBranchEntry(targetId: string): SessionEntry {
+		const target = this.byId.get(targetId);
+		if (!target) throw new Error(`Entry ${targetId} not found`);
+		if (!this.getBranch().some((entry) => entry.id === targetId)) {
+			throw new Error(`Entry ${targetId} is not on the active branch`);
+		}
+		return target;
+	}
+
+	/**
 	 * Append a branch-local edit to an earlier model-visible entry.
 	 * @param replacement Null omits the target, "source" restores its original content, a value replaces the content
-	 * @param visibility Lifetime of the edit's contribution, counted from the edit; omitted keeps the target's
+	 * @param options.visibility Lifetime of the edit's contribution, counted from the edit; omitted keeps the target's
+	 * @param options.priority Priority of the edit's contribution; omitted keeps the target's
 	 */
 	appendContextEdit(
 		targetId: string,
 		replacement: ContextEditEntry["replacement"],
-		visibility?: ContextVisibility,
+		options?: { visibility?: ContextVisibility; priority?: number },
 	): string {
 		if (
 			replacement !== null &&
@@ -1449,11 +1601,7 @@ export class SessionManager {
 		) {
 			throw new Error('Context edit replacement must be null, "source", or contain string/array content');
 		}
-		const target = this.byId.get(targetId);
-		if (!target) throw new Error(`Entry ${targetId} not found`);
-		if (!this.getBranch().some((entry) => entry.id === targetId)) {
-			throw new Error(`Entry ${targetId} is not on the active branch`);
-		}
+		const target = this._requireBranchEntry(targetId);
 		const editable =
 			target.type === "custom_message" ||
 			(target.type === "message" &&
@@ -1476,10 +1624,34 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			targetId,
 			replacement: normalizedReplacement,
-			...(visibility ? { visibility } : {}),
+			...(options?.visibility ? { visibility: options.visibility } : {}),
+			...(options?.priority !== undefined ? { priority: options.priority } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/**
+	 * Append branch-local values attached to an earlier entry on the active branch. A null value
+	 * clears that key. Returns the entry id.
+	 */
+	appendAnnotation(targetId: string, fields: Record<FieldKey, JsonValue | null>): string {
+		this._requireBranchEntry(targetId);
+		const entry: AnnotationEntry = {
+			type: "annotation",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			targetId,
+			fields,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Annotations of an entry resolved over the active branch: the latest value per key wins, null clears. */
+	getAnnotations(targetId: string): Record<FieldKey, JsonValue> {
+		return resolveAnnotations(this.getBranch()).get(targetId) ?? {};
 	}
 
 	// =========================================================================

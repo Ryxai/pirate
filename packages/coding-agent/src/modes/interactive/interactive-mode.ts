@@ -108,6 +108,7 @@ import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
+	type OmittedReason,
 	type SessionEntry,
 	SessionManager,
 	sessionEntryToContextMessages,
@@ -264,6 +265,37 @@ class BuiltInHeader extends ExpandableText {
 	}
 }
 
+/** A displayed custom message with a dim note below it while it contributes nothing on the current branch. */
+export class CustomMessageChatItem extends Container implements Expandable {
+	private readonly message: CustomMessageComponent;
+	private readonly marker: ThemedText;
+	private markerText: string | undefined;
+
+	constructor(message: CustomMessageComponent, outputPad: number) {
+		super();
+		this.message = message;
+		this.marker = new ThemedText(() => (this.markerText ? theme.fg("dim", this.markerText) : ""), outputPad, 0);
+		this.addChild(message);
+		this.addChild(this.marker);
+	}
+
+	setExpanded(expanded: boolean): void {
+		this.message.setExpanded(expanded);
+	}
+
+	setOutputPad(outputPad: number): void {
+		this.message.setOutputPad(outputPad);
+		this.marker.setPaddingX(outputPad);
+	}
+
+	/** `expired`, `superseded` or `omitted`; undefined removes the note. */
+	setMarker(text: string | undefined): void {
+		if (this.markerText === text) return;
+		this.markerText = text;
+		this.marker.invalidate();
+	}
+}
+
 type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
@@ -275,10 +307,19 @@ type CompactionCostNotice = {
 	usage: Usage;
 };
 
-type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" | "usage" }> | CompactionCostNotice;
+type RenderSessionItem =
+	| AgentMessage
+	| Extract<SessionEntry, { type: "custom" | "custom_message" | "usage" }>
+	| CompactionCostNotice;
 
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
+}
+
+function isCustomMessageSessionEntry(
+	item: RenderSessionItem,
+): item is Extract<SessionEntry, { type: "custom_message" }> {
+	return "type" in item && item.type === "custom_message";
 }
 
 function isCompactionCostNotice(item: RenderSessionItem): item is CompactionCostNotice {
@@ -507,6 +548,11 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+
+	// Displayed custom messages by entry id, for their omission notes (see refreshCustomMessageMarkers)
+	private customMessageItems = new Map<string, CustomMessageChatItem>();
+	// Rendered from message_start before the session persisted them; keyed once their entries exist
+	private unkeyedCustomMessageItems: CustomMessageChatItem[] = [];
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -2009,7 +2055,7 @@ export class InteractiveMode {
 						return { cancelled: true };
 					}
 
-					this.chatContainer.clear();
+					this.clearChat();
 					this.renderInitialMessages();
 					if (result.editorText && !this.editor.getText().trim()) {
 						this.editor.setText(result.editorText);
@@ -2209,7 +2255,7 @@ export class InteractiveMode {
 
 	private renderCurrentSessionState(): void {
 		this.loadedResourcesContainer.clear();
-		this.chatContainer.clear();
+		this.clearChat();
 		this.pendingMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
@@ -3434,7 +3480,14 @@ export class InteractiveMode {
 				} else {
 					this.clearStatusIndicator();
 				}
+				// The user message persisted before the turn may have ended a custom message's lifetime.
+				this.refreshCustomMessageMarkers();
 				this.ui.requestRender();
+				break;
+
+			case "turn_end":
+				// The turn's messages may have ended a custom message's lifetime.
+				this.refreshCustomMessageMarkers();
 				break;
 
 			case "queue_update":
@@ -3443,40 +3496,9 @@ export class InteractiveMode {
 				break;
 
 			case "entry_appended":
-				if (this.entriesRenderedByBoundaryCompaction.delete(event.entry.id)) break;
-				if (event.entry.type === "custom") {
-					this.addCustomEntryToChat(event.entry);
-					this.ui.requestRender();
-				} else if (event.entry.type === "usage" && event.entry.kind === "cache_warm") {
-					this.addCacheWarmingUsage(event.entry);
-					this.ui.requestRender();
-				} else if (event.entry.type === "custom_message" && event.entry.display) {
-					this.addMessageToChat(createCustomMessage(event.entry, event.entry.timestamp));
-					this.ui.requestRender();
-				} else if (event.entry.type === "compaction") {
-					const entries = this.sessionManager.buildContextEntries();
-					if (entries[0]?.id !== event.entry.id) break;
-					this.chatContainer.clear();
-					const branch = this.sessionManager.getBranch();
-					const compactionIndex = branch.findIndex((entry) => entry.id === event.entry.id);
-					const entriesAfterCompaction = new Set(branch.slice(compactionIndex + 1).map((entry) => entry.id));
-					const retainedEntries = entries.slice(1);
-					this.renderSessionEntries(retainedEntries.filter((entry) => !entriesAfterCompaction.has(entry.id)));
-					this.addMessageToChat(
-						createCompactionSummaryMessage(event.entry.summary, event.entry.tokensBefore, event.entry.timestamp),
-					);
-					if (event.entry.usage) {
-						this.addCompactionCostNotice({
-							type: "compaction_cost",
-							kind: "compaction",
-							usage: event.entry.usage,
-						});
-					}
-					this.renderSessionEntries(retainedEntries.filter((entry) => entriesAfterCompaction.has(entry.id)));
-					for (const entryId of entriesAfterCompaction) this.entriesRenderedByBoundaryCompaction.add(entryId);
-					this.footer.invalidate();
-					this.ui.requestRender();
-				}
+				this.handleEntryAppended(event.entry);
+				// An edit, annotation or expiring entry changes what earlier custom messages contribute.
+				this.refreshCustomMessageMarkers();
 				break;
 
 			case "session_info_changed":
@@ -3702,7 +3724,7 @@ export class InteractiveMode {
 					if (entries[0]?.type !== "compaction") {
 						throw new Error("Completed compaction is missing from the session context");
 					}
-					this.chatContainer.clear();
+					this.clearChat();
 					// The latest compaction is prepended for model context; append it below at its chronological position.
 					this.renderSessionEntries(entries.slice(1));
 					this.addMessageToChat(
@@ -3870,7 +3892,64 @@ export class InteractiveMode {
 		this.chatContainer.addChild(component);
 	}
 
-	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+	private handleEntryAppended(entry: SessionEntry): void {
+		if (this.entriesRenderedByBoundaryCompaction.delete(entry.id)) return;
+		if (entry.type === "custom") {
+			this.addCustomEntryToChat(entry);
+			this.ui.requestRender();
+		} else if (entry.type === "usage" && entry.kind === "cache_warm") {
+			this.addCacheWarmingUsage(entry);
+			this.ui.requestRender();
+		} else if (entry.type === "custom_message" && entry.display) {
+			this.addMessageToChat(createCustomMessage(entry, entry.timestamp), { entryId: entry.id });
+			this.ui.requestRender();
+		} else if (entry.type === "compaction") {
+			const entries = this.sessionManager.buildContextEntries();
+			if (entries[0]?.id !== entry.id) return;
+			this.clearChat();
+			const branch = this.sessionManager.getBranch();
+			const compactionIndex = branch.findIndex((candidate) => candidate.id === entry.id);
+			const entriesAfterCompaction = new Set(branch.slice(compactionIndex + 1).map((candidate) => candidate.id));
+			const retainedEntries = entries.slice(1);
+			this.renderSessionEntries(retainedEntries.filter((retained) => !entriesAfterCompaction.has(retained.id)));
+			this.addMessageToChat(createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp));
+			if (entry.usage) {
+				this.addCompactionCostNotice({ type: "compaction_cost", kind: "compaction", usage: entry.usage });
+			}
+			this.renderSessionEntries(retainedEntries.filter((retained) => entriesAfterCompaction.has(retained.id)));
+			for (const entryId of entriesAfterCompaction) this.entriesRenderedByBoundaryCompaction.add(entryId);
+			this.footer.invalidate();
+			this.ui.requestRender();
+		}
+	}
+
+	/** Clear the transcript and the custom message items it held. */
+	private clearChat(): void {
+		this.chatContainer.clear();
+		this.customMessageItems.clear();
+		this.unkeyedCustomMessageItems = [];
+	}
+
+	/**
+	 * Note below each displayed custom message whether it still contributes on the current branch.
+	 * Items rendered from message_start are keyed here once persisted: both lists are in append order.
+	 */
+	private refreshCustomMessageMarkers(): void {
+		if (this.customMessageItems.size === 0 && this.unkeyedCustomMessageItems.length === 0) return;
+		for (const { sourceEntry, omitted } of this.sessionManager.buildSessionProjection().entries) {
+			if (sourceEntry.type !== "custom_message" || !sourceEntry.display) continue;
+			let item = this.customMessageItems.get(sourceEntry.id);
+			if (!item) {
+				item = this.unkeyedCustomMessageItems.shift();
+				if (!item) continue;
+				this.customMessageItems.set(sourceEntry.id, item);
+			}
+			item.setMarker(omitted === "edit" ? "omitted" : omitted);
+		}
+		this.ui.requestRender();
+	}
+
+	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean; entryId?: string }): void {
 		switch (message.role) {
 			case "bashExecution": {
 				const component = new BashExecutionComponent(
@@ -3900,8 +3979,14 @@ export class InteractiveMode {
 						this.getMarkdownThemeWithSettings(),
 						this.outputPad,
 					);
-					component.setExpanded(this.toolOutputExpanded);
-					this.chatContainer.addChild(component);
+					const item = new CustomMessageChatItem(component, this.outputPad);
+					item.setExpanded(this.toolOutputExpanded);
+					this.chatContainer.addChild(item);
+					if (options?.entryId) {
+						this.customMessageItems.set(options.entryId, item);
+					} else {
+						this.unkeyedCustomMessageItems.push(item);
+					}
 				}
 				break;
 			}
@@ -4015,6 +4100,10 @@ export class InteractiveMode {
 				this.addCustomEntryToChat(item);
 				continue;
 			}
+			if (isCustomMessageSessionEntry(item)) {
+				this.addMessageToChat(createCustomMessage(item, item.timestamp), { entryId: item.id });
+				continue;
+			}
 			if (isUsageSessionEntry(item)) {
 				this.addCacheWarmingUsage(item);
 				continue;
@@ -4100,7 +4189,11 @@ export class InteractiveMode {
 		// Selection coordinates point into the transcript being replaced (#9311).
 		if (this.renderer instanceof TuiAltScreen) this.renderer.resetTextSelection();
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
-			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
+			if (
+				entry.type === "custom" ||
+				entry.type === "custom_message" ||
+				(entry.type === "usage" && entry.kind === "cache_warm")
+			) {
 				return [entry];
 			}
 			const messages = sessionEntryToContextMessages(entry);
@@ -4110,6 +4203,7 @@ export class InteractiveMode {
 			return messages;
 		});
 		this.renderSessionItems(items, options);
+		this.refreshCustomMessageMarkers();
 	}
 
 	private addCacheWarmingUsage(entry: UsageEntry): void {
@@ -4263,7 +4357,7 @@ export class InteractiveMode {
 	}
 
 	private rebuildChatFromMessages(): void {
-		this.chatContainer.clear();
+		this.clearChat();
 		this.renderSessionEntries(this.sessionManager.buildContextEntries());
 	}
 
@@ -5569,6 +5663,10 @@ export class InteractiveMode {
 		const tree = this.sessionManager.getTree();
 		const realLeafId = this.sessionManager.getLeafId();
 		const initialFilterMode = this.settingsManager.getTreeFilterMode();
+		const omitted = new Map<string, OmittedReason>();
+		for (const entry of this.sessionManager.buildSessionProjection().entries) {
+			if (entry.omitted) omitted.set(entry.sourceEntry.id, entry.omitted);
+		}
 
 		if (tree.length === 0) {
 			this.showStatus("No entries in session");
@@ -5671,7 +5769,7 @@ export class InteractiveMode {
 						}
 
 						// Update UI
-						this.chatContainer.clear();
+						this.clearChat();
 						this.renderInitialMessages();
 						if (result.editorText && !this.editor.getText().trim()) {
 							this.editor.setText(result.editorText);
@@ -5697,6 +5795,7 @@ export class InteractiveMode {
 				},
 				initialSelectedId,
 				initialFilterMode,
+				omitted,
 			);
 			selector.onCopy = async (text) => {
 				if (!text) {

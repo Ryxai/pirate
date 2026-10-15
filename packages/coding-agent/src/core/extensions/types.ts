@@ -65,7 +65,7 @@ import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
-import type { ContextVisibility, CustomMessage } from "../messages.ts";
+import type { ContextVisibility, CustomMessage, CustomMessageInput, FieldHolder, FieldKey } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type {
@@ -455,7 +455,7 @@ export interface ExtensionCommandContext extends ExtensionContext {
  */
 export interface ReplacedSessionContext extends ExtensionCommandContext {
 	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility" | "position">,
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void>;
 
@@ -999,23 +999,26 @@ export interface CustomEntryDraft {
 	type: "custom";
 	customType: string;
 	data?: unknown;
+	/** Extension-owned values by FieldKey, for other code to read. */
+	fields?: Record<FieldKey, JsonValue>;
 }
 
-export interface CustomMessageEntryDraft {
-	type: "custom_message";
-	customType: string;
-	content: string | (TextContent | ImageContent)[];
-	display: boolean;
-	details?: unknown;
-	visibility?: ContextVisibility;
-	position?: "tail";
-}
+export type CustomMessageEntryDraft = { type: "custom_message" } & CustomMessageInput;
 
 export interface ContextEditEntryDraft {
 	type: "context_edit";
 	targetId: string;
 	replacement: ContextEditEntry["replacement"];
 	visibility?: ContextVisibility;
+	/** Priority of the edit's contribution; omitted keeps the target's. */
+	priority?: number;
+}
+
+/** Branch-local values attached to an earlier entry; null clears a key. */
+export interface AnnotationEntryDraft {
+	type: "annotation";
+	targetId: string;
+	fields: Record<FieldKey, JsonValue | null>;
 }
 
 export interface CompactionEntryDraft {
@@ -1031,6 +1034,7 @@ export type SessionBoundaryDraft =
 	| CustomEntryDraft
 	| CustomMessageEntryDraft
 	| ContextEditEntryDraft
+	| AnnotationEntryDraft
 	| CompactionEntryDraft;
 
 export interface BoundaryContextPreview {
@@ -1523,7 +1527,7 @@ export interface MessageEndEventResult {
 }
 
 export interface BeforeAgentStartEventResult {
-	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "visibility" | "position">;
+	message?: CustomMessageInput;
 	/** Replace the complete system prompt for this turn. Later handlers observe this exact override. */
 	systemPrompt?: string;
 }
@@ -1614,6 +1618,17 @@ export interface ResolvedCommand extends RegisteredCommand {
 /** Handler function type for events */
 // biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
+
+/** Identity of an extension-owned field; see {@link ExtensionAPI.registerField}. */
+export interface FieldSpec {
+	/** Owner of the field, such as the extension's name. */
+	namespace: string;
+	name: string;
+	/** Bumped when the value's shape changes; entries written under the old key keep it. */
+	version: number;
+}
+
+export type { FieldHolder } from "../messages.ts";
 
 /**
  * ExtensionAPI passed to extension factory functions.
@@ -1753,12 +1768,31 @@ export interface ExtensionAPI {
 	registerToolRenderer(resolver: ToolRendererResolver): void;
 
 	// =========================================================================
+	// Extension Fields
+	// =========================================================================
+
+	/**
+	 * Register a field this extension owns and return its key, `"<namespace>/<name>@<version>"`.
+	 * Fields hold values other code may read, under `fields` on entries, messages, and annotations;
+	 * keep private state in `details` or `data`. Pi never interprets them, and it cannot tell which
+	 * extension wrote an entry: set fields only on entries you create. A key another extension
+	 * registered in this load is reported as an extension error; the key is still returned.
+	 */
+	registerField(spec: FieldSpec): FieldKey;
+
+	/** Read one field of an entry or message. */
+	getField<T extends JsonValue>(holder: FieldHolder, key: FieldKey): T | undefined;
+
+	/** Keys of the fields present on an entry or message, all of them or those of one namespace. */
+	listFields(holder: FieldHolder, namespace?: string): FieldKey[];
+
+	// =========================================================================
 	// Actions
 	// =========================================================================
 
 	/** Send a custom message to the session. */
 	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility" | "position">,
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void;
 
@@ -1772,8 +1806,11 @@ export interface ExtensionAPI {
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): void;
 
-	/** Append a custom entry to the session for state persistence (not sent to LLM). */
-	appendEntry<T = unknown>(customType: string, data?: T): void;
+	/**
+	 * Append a custom entry to the session for state persistence (not sent to LLM). `fields` holds
+	 * values other code may read, by registered key; `data` is the extension's own state.
+	 */
+	appendEntry<T = unknown>(customType: string, data?: T, fields?: Record<FieldKey, JsonValue>): void;
 
 	// =========================================================================
 	// Session Metadata
@@ -1787,6 +1824,13 @@ export interface ExtensionAPI {
 
 	/** Set or clear a label on an entry. Labels are user-defined markers for bookmarking/navigation. */
 	setLabel(entryId: string, label: string | undefined): void;
+
+	/**
+	 * Attach field values to an entry on the active branch as a new annotation entry. The latest
+	 * value per key wins and null clears a key; read them with `ctx.sessionManager.getAnnotations()`.
+	 * Throws when the target does not exist or is not on the active branch.
+	 */
+	annotate(targetId: string, fields: Record<FieldKey, JsonValue | null>): void;
 
 	/** Execute a shell command. */
 	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
@@ -2130,7 +2174,7 @@ export interface ExtensionShortcut {
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 export type SendMessageHandler = <T = unknown>(
-	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility" | "position">,
+	message: CustomMessageInput<T>,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 
@@ -2139,7 +2183,11 @@ export type SendUserMessageHandler = (
 	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 ) => void;
 
-export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
+export type AppendEntryHandler = <T = unknown>(
+	customType: string,
+	data?: T,
+	fields?: Record<FieldKey, JsonValue>,
+) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
 
@@ -2176,6 +2224,8 @@ export type SetThinkingLevelHandler = (level: ThinkingLevel) => void;
 
 export type SetLabelHandler = (entryId: string, label: string | undefined) => void;
 
+export type AnnotateHandler = (targetId: string, fields: Record<FieldKey, JsonValue | null>) => void;
+
 /**
  * Shared state created by loader, used during registration and runtime.
  * Contains flag values (defaults set during registration, CLI values set after).
@@ -2188,6 +2238,15 @@ export interface ExtensionRuntimeState {
 	pendingNativeProviderRegistrations: Array<{ provider: Provider; extensionPath: string }>;
 	/** Virtual model registrations queued during extension loading, processed when runner binds. */
 	pendingVirtualModelRegistrations: Array<{ definition: VirtualModelDefinition; extensionPath: string }>;
+	/** Field registrations queued during extension loading, processed when runner binds. */
+	pendingFieldRegistrations: Array<{ key: FieldKey; extensionPath: string }>;
+	/**
+	 * Record a field key and the extension that registered it.
+	 *
+	 * Before bindCore(): queues the registration. After bindCore(): the runner records it and
+	 * reports a key another extension registered.
+	 */
+	registerField: (key: FieldKey, extensionPath: string) => void;
 	/** Create an extension context. Throws before the runner binds. */
 	createContext: () => ExtensionContext;
 	/** Throws when this extension instance is stale after runtime replacement. */
@@ -2222,6 +2281,7 @@ export interface ExtensionActions {
 	setSessionName: SetSessionNameHandler;
 	getSessionName: GetSessionNameHandler;
 	setLabel: SetLabelHandler;
+	annotate: AnnotateHandler;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
 	getSettings: GetSettingsHandler;

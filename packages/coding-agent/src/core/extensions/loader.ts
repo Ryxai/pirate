@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Provider } from "@earendil-works/pi-ai";
+import type { JsonValue, Provider } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
@@ -16,6 +16,7 @@ import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
 import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
+import { type FieldKey, fieldKey, getField, listFields } from "../messages.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
@@ -27,6 +28,8 @@ import type {
 	ExtensionFactory,
 	ExtensionRuntime,
 	ExtensionVirtualModel,
+	FieldHolder,
+	FieldSpec,
 	LoadExtensionsResult,
 	MarkdownTransformer,
 	MessageRenderer,
@@ -173,6 +176,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setSessionName: notInitialized,
 		getSessionName: notInitialized,
 		setLabel: notInitialized,
+		annotate: notInitialized,
 		getActiveTools: notInitialized,
 		getAllTools: notInitialized,
 		getSettings: notInitialized,
@@ -188,6 +192,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		pendingNativeProviderRegistrations: [],
 		mcpServers: new McpServerRegistry(),
 		pendingVirtualModelRegistrations: [],
+		pendingFieldRegistrations: [],
 		createContext: notInitialized,
 		assertActive,
 		invalidate: (message) => {
@@ -230,6 +235,9 @@ export function createExtensionRuntime(): ExtensionRuntime {
 			runtime.pendingVirtualModelRegistrations = runtime.pendingVirtualModelRegistrations.filter(
 				({ definition }) => definition.provider !== provider || definition.id !== id,
 			);
+		},
+		registerField: (key, extensionPath) => {
+			runtime.pendingFieldRegistrations.push({ key, extensionPath });
 		},
 	};
 
@@ -370,6 +378,24 @@ function createExtensionAPI(
 			extension.toolRenderers.push(resolver);
 		},
 
+		// Fields - the runner records the owner once it binds and reports conflicts
+		registerField(spec: FieldSpec): FieldKey {
+			assertActive();
+			const key = fieldKey(spec.namespace, spec.name, spec.version);
+			applyRuntimeChange(() => runtime.registerField(key, extension.path));
+			return key;
+		},
+
+		getField<T extends JsonValue>(holder: FieldHolder, key: FieldKey): T | undefined {
+			assertActive();
+			return getField<T>(holder, key);
+		},
+
+		listFields(holder: FieldHolder, namespace?: string): FieldKey[] {
+			assertActive();
+			return listFields(holder, namespace);
+		},
+
 		// Flag access - checks extension registered it, reads from runtime
 		getFlag(name: string): boolean | string | undefined {
 			assertActive();
@@ -388,9 +414,9 @@ function createExtensionAPI(
 			runtime.sendUserMessage(content, options);
 		},
 
-		appendEntry(customType: string, data?: unknown): void {
+		appendEntry(customType: string, data?: unknown, fields?: Record<FieldKey, JsonValue>): void {
 			assertActive();
-			runtime.appendEntry(customType, data);
+			runtime.appendEntry(customType, data, fields);
 		},
 
 		setSessionName(name: string): void {
@@ -406,6 +432,11 @@ function createExtensionAPI(
 		setLabel(entryId: string, label: string | undefined): void {
 			assertActive();
 			runtime.setLabel(entryId, label);
+		},
+
+		annotate(targetId: string, fields: Record<FieldKey, JsonValue | null>): void {
+			assertActive();
+			runtime.annotate(targetId, fields);
 		},
 
 		exec(command: string, args: string[], options?: ExecOptions) {

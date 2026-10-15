@@ -144,7 +144,7 @@ Append-only edit of one earlier context-producing entry. It changes only future 
 {"type":"context_edit","id":"g6h7i8j9","parentId":"f6g7h8i9","timestamp":"2024-12-03T14:11:00.000Z","targetId":"c3d4e5f6","replacement":null}
 ```
 
-Targets may be user, assistant, tool-result, or custom-message entries. `replacement: null` omits the target from model context. `replacement: "source"` restores the target's original content. Any other `replacement` replaces only the target message content. String replacements for assistant and tool-result entries are normalized to one text block because those roles require content arrays. If several edits target the same entry, the latest edit on the active branch wins. An edit keeps the target's `visibility`, counted from the edit, unless it carries its own: `visibility: {}` makes the contribution permanent, and any other value bounds it with the same conditions as on `custom_message` entries. Edits are branch-relative: navigating to a point before the edit reveals the target's original contribution again.
+Targets may be user, assistant, tool-result, or custom-message entries. `replacement: null` omits the target from model context. `replacement: "source"` restores the target's original content. Any other `replacement` replaces only the target message content. String replacements for assistant and tool-result entries are normalized to one text block because those roles require content arrays. If several edits target the same entry, the latest edit on the active branch wins. An edit keeps the target's `visibility`, counted from the edit, unless it carries its own: `visibility: {}` makes the contribution permanent, and any other value bounds it with the same conditions as on `custom_message` entries. `priority` sets the priority of the edit's contribution and wins over the target's own; see `priority` under [CustomMessageEntry](#custommessageentry). Edits are branch-relative: navigating to a point before the edit reveals the target's original contribution again.
 
 ### BranchSummaryEntry
 
@@ -166,10 +166,12 @@ Optional fields:
 Extension state persistence. Does NOT participate in LLM context.
 
 ```json
-{"type":"custom","id":"h8i9j0k1","parentId":"g7h8i9j0","timestamp":"2024-12-03T14:20:00.000Z","customType":"my-extension","data":{"count":42}}
+{"type":"custom","id":"h8i9j0k1","parentId":"g7h8i9j0","timestamp":"2024-12-03T14:20:00.000Z","customType":"my-extension","data":{"count":42},"fields":{"my-extension/phase@1":"review"}}
 ```
 
 Use `customType` to identify your extension's entries on reload. Interactive mode can render custom entries via `pi.registerEntryRenderer(customType, renderer)`, but they still do not participate in LLM context.
+
+`data` is the extension's own state. Optional `fields` holds values other code may read, by registered field key; see [Fields](#fields).
 
 Pi stores [virtual model](virtual-models.md) router state as custom entries with `customType` `pi.virtual-model-state` and `data` `{ provider, modelId, state }`.
 
@@ -185,8 +187,11 @@ Fields:
 - `content`: String or `(TextContent | ImageContent)[]` (same as UserMessage)
 - `display`: `true` = show in TUI with distinct styling, `false` = hidden
 - `details`: Optional extension-specific metadata (not sent to LLM)
-- `visibility`: Optional `{ until?, key? }`. `until` is `"assistant_message"`, `"user_message"`, `"compaction"`, `{ assistantMessages: n }`, or `{ customType }`; the entry leaves model context once a matching entry follows it on the active branch. A later `custom_message` with the same `key` supersedes it. Omitted means it stays in context.
+- `visibility`: Optional `{ until?, key? }`. `until` is `"assistant_message"`, `"user_message"`, `"compaction"`, `{ assistantMessages: n }`, `{ customType }`, or `{ tokens: n }`; the entry leaves model context once a matching entry follows it on the active branch, or, for `{ tokens: n }`, once the estimated tokens of the entries that followed exceed `n`. A later `custom_message` with the same `key` supersedes it. Omitted means it stays in context.
 - `position`: Optional `"tail"`. The entry is projected after every other message of the request.
+- `priority`: Optional number. Declares the entry evictable from a request copy under pressure, lowest first; see [Context projection](extensions.md#context-projection). Omitted means conversation content, never evicted. A later `context_edit` with its own `priority` overrides it.
+- `ref`: Optional id of the entry this message re-sends. `content` is a copy of that entry's model content, taken when the message was appended and never empty; `ref` records where it came from.
+- `fields`: Optional values other code may read, by registered field key; see [Fields](#fields).
 
 ### LabelEntry
 
@@ -198,6 +203,16 @@ User-defined bookmark/marker on an entry.
 
 Set `label` to `undefined` to clear a label.
 
+### AnnotationEntry
+
+Branch-local values attached to an earlier entry, by registered field key (see [Fields](#fields)). Appended by `pi.annotate()` or an `annotation` boundary draft; the target must exist and be on the active branch.
+
+```json
+{"type":"annotation","id":"k0l1m2n3","parentId":"j0k1l2m3","timestamp":"2024-12-03T14:32:00.000Z","targetId":"a1b2c3d4","fields":{"scoring/score@1":5,"scoring/note@1":null}}
+```
+
+Annotations resolve over the active branch: for each `(targetId, key)` the latest entry wins and `null` clears the key. `SessionManager.getAnnotations(targetId)` and `buildSessionProjection().annotations` return the resolved values. Annotations do not participate in LLM context, and one older than a compaction cut still applies to a retained target. Like context edits, they are branch-relative.
+
 ### SessionInfoEntry
 
 Session metadata (e.g., user-defined display name). Set via `/name`, `--name` / `-n`, or `pi.setSessionName()` in extensions.
@@ -207,6 +222,10 @@ Session metadata (e.g., user-defined display name). Set via `/name`, `--name` / 
 ```
 
 The session name is displayed in the session selector (`/resume`) instead of the first message when set.
+
+## Fields
+
+`custom`, `custom_message`, and `annotation` entries carry a `fields` object: extension-owned values that other code may read. Keys are `"<namespace>/<name>@<version>"`, as `pi.registerField()` returns them, so extensions do not collide and a value whose shape changes gets a new key while entries written under the old key keep it. Values are JSON. Pi never interprets fields; it stores them, copies them onto the custom messages built from `custom_message` entries, and resolves annotations. Keep private state in `details` or `data`. Pi cannot tell which extension wrote an entry, so set fields only on entries you create and use annotations for entries you did not.
 
 ## Tree Structure
 
@@ -234,7 +253,7 @@ Entries normally form one tree, but navigation APIs can create multiple roots:
    - Includes entries after the compaction entry
 3. Preserves non-message entries in the selected range so interactive mode can render them
 
-`buildSessionProjection()` then applies the latest `context_edit` for each selected target and omits `custom_message` entries whose `visibility` has ended, i.e. a matching entry follows them on the path, unless a `context_edit` appended after that entry overrides it. Entries and messages stay in branch order; `buildSessionContext()` and requests move `position: "tail"` messages last. It returns the model-visible messages together with their source entries. Omitted targets produce no message; replacements retain the source entry's role and metadata while changing only content. The raw selected entries are not modified.
+`buildSessionProjection()` then applies the latest `context_edit` for each selected target and omits `custom_message` entries whose `visibility` has ended, i.e. a matching entry follows them on the path, unless a `context_edit` appended after that entry overrides it. Entries and messages stay in branch order; `buildSessionContext()` and requests move `position: "tail"` messages last. It returns the model-visible messages together with their source entries. Omitted targets produce no message; replacements retain the source entry's role and metadata while changing only content. The raw selected entries are not modified. A projected entry whose source has content but contributes nothing says why in `omitted`: `"edit"` for a null replacement, even once the lifetime the target had has ended, `"expired"` for an ended `until`, or `"superseded"` for a later message with the same `key`; stale older compaction summaries get no reason. `priority` is the resolved priority, the latest edit's else the entry's own. The projection also carries `annotations`, the resolved annotations by target entry id over the whole path.
 
 `buildSessionContext()` builds on that projection to produce the message list for the LLM:
 
@@ -244,7 +263,7 @@ Entries normally form one tree, but navigation APIs can create multiple roots:
    - `compaction` -> complete system checkpoint followed by `compactionSummary`
    - `branch_summary` -> `branchSummary`
    - `custom_message` -> `CustomMessage`
-   - `context_edit` -> no context message of its own
+   - `context_edit` and `annotation` -> no context message of their own
    - `usage` and `custom` -> no context message
 
 The compaction summary replaces entries before `firstKeptEntryId`. Pre-compaction system messages are folded into the complete checkpoint rather than replayed from the retained range. Retained non-system entries and all entries after the compaction remain available to the LLM.
@@ -283,6 +302,12 @@ for (const line of lines) {
       break;
     case "label":
       console.log(`[${entry.id}] Label "${entry.label}" on ${entry.targetId}`);
+      break;
+    case "context_edit":
+      console.log(`[${entry.id}] Context edit of ${entry.targetId}: ${JSON.stringify(entry.replacement)}`);
+      break;
+    case "annotation":
+      console.log(`[${entry.id}] Annotation on ${entry.targetId}: ${JSON.stringify(entry.fields)}`);
       break;
     case "model_change":
       console.log(`[${entry.id}] Model: ${entry.provider}/${entry.modelId}`);

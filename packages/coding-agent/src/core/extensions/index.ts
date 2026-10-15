@@ -30,6 +30,8 @@ export type {
 	// Re-exports
 	AgentToolResult,
 	AgentToolUpdateCallback,
+	AnnotateHandler,
+	AnnotationEntryDraft,
 	AppendEntryHandler,
 	// App keybindings (for custom editors)
 	AppKeybinding,
@@ -97,6 +99,8 @@ export type {
 	ExtensionUIDialogOptions,
 	ExtensionVirtualModel,
 	ExtensionWidgetOptions,
+	FieldHolder,
+	FieldSpec,
 	FindToolCallEvent,
 	FindToolResultEvent,
 	GetActiveToolsHandler,

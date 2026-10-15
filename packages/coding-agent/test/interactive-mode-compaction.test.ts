@@ -87,7 +87,7 @@ describe("InteractiveMode compaction events", () => {
 				usage: previousUsage,
 			},
 		];
-		const fakeThis = { renderSessionItems: vi.fn() };
+		const fakeThis = { renderSessionItems: vi.fn(), refreshCustomMessageMarkers: vi.fn() };
 		const renderSessionEntries = Reflect.get(InteractiveMode.prototype, "renderSessionEntries") as (
 			this: typeof fakeThis,
 			entries: SessionEntry[],
@@ -143,7 +143,7 @@ describe("InteractiveMode compaction events", () => {
 			autoCompactionLoader: undefined,
 			defaultEditor: {},
 			statusContainer: { clear: vi.fn() },
-			chatContainer: { clear: vi.fn() },
+			clearChat: vi.fn(),
 			sessionManager: { buildContextEntries: vi.fn().mockReturnValue([latestCompaction, previousCompaction]) },
 			renderSessionEntries: vi.fn(),
 			addMessageToChat: vi.fn(),
@@ -180,7 +180,7 @@ describe("InteractiveMode compaction events", () => {
 			willRetry: false,
 		});
 
-		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
+		expect(fakeThis.clearChat).toHaveBeenCalledTimes(1);
 		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith([previousCompaction]);
 		expect(fakeThis.addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(fakeThis.addMessageToChat).toHaveBeenCalledWith(
@@ -207,6 +207,7 @@ describe("InteractiveMode compaction events", () => {
 			workingVisible: true,
 			showWorkingStatusIndicator: vi.fn(),
 			clearStatusIndicator: vi.fn(),
+			refreshCustomMessageMarkers: vi.fn(),
 			settingsManager: { getShowTerminalProgress: () => true },
 			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
 		};

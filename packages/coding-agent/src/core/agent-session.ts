@@ -117,7 +117,13 @@ import {
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
-import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
+import {
+	type BashExecutionMessage,
+	type CustomMessage,
+	type CustomMessageInput,
+	convertToLlm,
+	createCustomMessage,
+} from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
@@ -1051,13 +1057,19 @@ export class AgentSession {
 			let entryId: string;
 			switch (draft.type) {
 				case "custom":
-					entryId = manager.appendCustomEntry(draft.customType, draft.data);
+					entryId = manager.appendCustomEntry(draft.customType, draft.data, draft.fields);
 					break;
 				case "custom_message":
 					entryId = manager.appendCustomMessageEntry(draft);
 					break;
 				case "context_edit":
-					entryId = manager.appendContextEdit(draft.targetId, draft.replacement, draft.visibility);
+					entryId = manager.appendContextEdit(draft.targetId, draft.replacement, {
+						visibility: draft.visibility,
+						priority: draft.priority,
+					});
+					break;
+				case "annotation":
+					entryId = manager.appendAnnotation(draft.targetId, draft.fields);
 					break;
 				case "compaction": {
 					const tokensBefore = estimateProjectedContextTokens(
@@ -1082,10 +1094,17 @@ export class AgentSession {
 		return appended;
 	}
 
+	/**
+	 * A copy of the session, at the same leaf, with `drafts` applied. It holds every entry, not only
+	 * the branch, so a draft's `ref` to an entry on another branch resolves as it does on the session.
+	 */
 	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
 		const header = this.sessionManager.getHeader();
 		if (!header) throw new Error("Session header is missing");
-		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
+		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getEntries()]);
+		const leafId = this.sessionManager.getLeafId();
+		if (leafId) manager.branch(leafId);
+		else manager.resetLeaf();
 		this._applyBoundaryDrafts(manager, drafts);
 		return manager;
 	}
@@ -2016,22 +2035,22 @@ export class AgentSession {
 				timestamp: Date.now(),
 			});
 		}
+		// A handler message with a bad ref is reported and left out here, before the run starts,
+		// instead of failing when the message is persisted mid-run.
+		for (const msg of result.messages) {
+			try {
+				messages.push(this._createCustomMessage(msg));
+			} catch (error) {
+				this._extensionRunner.emitError({
+					extensionPath: "<runtime>",
+					event: "before_agent_start",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		// Inject any pending "nextTurn" messages as context alongside the starting message
 		messages.push(...this._pendingNextTurnMessages);
 		this._pendingNextTurnMessages = [];
-		for (const msg of result.messages) {
-			messages.push({
-				role: "custom",
-				customType: msg.customType,
-				// Untyped extensions can pass null/missing content; normalize at ingestion.
-				content: msg.content ?? [],
-				display: msg.display,
-				details: msg.details,
-				...(msg.visibility ? { visibility: msg.visibility } : {}),
-				...(msg.position ? { position: msg.position } : {}),
-				timestamp: Date.now(),
-			});
-		}
 		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
@@ -2406,6 +2425,17 @@ export class AgentSession {
 	}
 
 	/**
+	 * The in-memory message of a custom message input. With `ref`, the content is copied from that
+	 * entry now, so a bad ref throws to the caller: steered and followed-up messages are persisted
+	 * at message_end, where a throw would end the run instead.
+	 */
+	private _createCustomMessage(message: CustomMessageInput): CustomMessage {
+		const content = message.ref === undefined ? {} : { content: this.sessionManager.copyRefContent(message.ref) };
+		// Untyped extensions can pass null/missing content; createCustomMessage normalizes at ingestion.
+		return createCustomMessage({ ...message, ...content }, new Date().toISOString());
+	}
+
+	/**
 	 * Send a custom message to the session. Creates a CustomMessageEntry.
 	 *
 	 * Handles four cases:
@@ -2414,25 +2444,16 @@ export class AgentSession {
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
-	 * @param message Custom message with customType, content, display, details, visibility, position
+	 * @param message Custom message; see CustomMessageInput. With `ref`, the message carries a copy
+	 *   of that entry's content. Throws when `ref` names no content-bearing entry.
 	 * @param options.triggerTurn If true and not streaming, triggers a new LLM turn
 	 * @param options.deliverAs Delivery mode: "steer", "followUp", or "nextTurn"
 	 */
 	async sendCustomMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "visibility" | "position">,
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
-		const appMessage = {
-			role: "custom" as const,
-			customType: message.customType,
-			// Untyped extensions can pass null/missing content; normalize at ingestion.
-			content: message.content ?? [],
-			display: message.display,
-			details: message.details,
-			...(message.visibility ? { visibility: message.visibility } : {}),
-			...(message.position ? { position: message.position } : {}),
-			timestamp: Date.now(),
-		} satisfies CustomMessage<T>;
+		const appMessage = this._createCustomMessage(message);
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
@@ -3404,6 +3425,7 @@ export class AgentSession {
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		this._extensionRunner.reportUnhandledMcpServers();
+		this._extensionRunner.reportFieldConflicts();
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
 	}
 
@@ -3529,8 +3551,8 @@ export class AgentSession {
 						});
 					});
 				},
-				appendEntry: (customType, data) => {
-					const entryId = this.sessionManager.appendCustomEntry(customType, data);
+				appendEntry: (customType, data, fields) => {
+					const entryId = this.sessionManager.appendCustomEntry(customType, data, fields);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
 						this._emit({ type: "entry_appended", entry });
@@ -3544,6 +3566,11 @@ export class AgentSession {
 				},
 				setLabel: (entryId, label) => {
 					this.sessionManager.appendLabelChange(entryId, label);
+				},
+				annotate: (targetId, fields) => {
+					const entryId = this.sessionManager.appendAnnotation(targetId, fields);
+					const entry = this.sessionManager.getEntry(entryId);
+					if (entry) this._emit({ type: "entry_appended", entry });
 				},
 				getActiveTools: () => this.getActiveToolNames(),
 				getAllTools: () => this.getAllTools(),
@@ -3821,6 +3848,7 @@ export class AgentSession {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 			this._extensionRunner.reportUnhandledMcpServers();
+			this._extensionRunner.reportFieldConflicts();
 			await this.extendResourcesFromExtensions("reload");
 		}
 	}

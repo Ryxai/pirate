@@ -20,7 +20,7 @@ import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-sessi
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import type { ExtensionError, ExtensionRunner, ExtensionUIContext } from "../../src/core/extensions/index.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
-import { SessionManager } from "../../src/core/session-manager.ts";
+import { type SessionEntry, SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import type { InlineExtension, ResourceLoader } from "../../src/index.ts";
@@ -60,6 +60,13 @@ export function getAssistantTexts(harness: Harness): string[] {
 	return harness.session.messages
 		.filter((message) => message.role === "assistant")
 		.map((message) => getMessageText(message));
+}
+
+/** Id of the first user message among `entries`, for example a branch read inside an extension handler. */
+export function firstUserEntryId(entries: SessionEntry[]): string {
+	const user = entries.find((entry) => entry.type === "message" && entry.message.role === "user");
+	if (!user) throw new Error("missing user entry");
+	return user.id;
 }
 
 /** The latest result of `toolName` in the session transcript. */

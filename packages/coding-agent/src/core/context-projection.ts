@@ -3,14 +3,16 @@
  *
  * The canonical projection (`buildSessionProjection`) applies persisted edits and visibility.
  * `projectContext` lets an extension derive one request's copy from it: drop entries, bring
- * omitted ones back, and move content to the tail, within the compaction budget. Additions
- * are evicted first when the copy would cross the threshold; canonical messages never are.
+ * omitted ones back, and move content to the tail, within the compaction budget. When the copy
+ * would cross the threshold, additions are evicted first, then canonical content whose entry
+ * declares a priority; content without a declared priority is never evicted.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, JsonValue, TextContent } from "@earendil-works/pi-ai";
 import { estimateMessagesTokens } from "./compaction/compaction.ts";
-import type { CustomMessage } from "./messages.ts";
+import type { CustomMessage, FieldKey } from "./messages.ts";
 import {
+	type OmittedReason,
 	type ProjectedSessionEntry,
 	type SessionProjection,
 	sessionEntryToContextMessages,
@@ -33,7 +35,9 @@ export interface ContextBudget {
  * - include: the canonical contribution of a present entry, or the source content of an omitted
  *   one. `placement` "tail" re-sends the content after every other message as a custom message,
  *   which keeps the cached prefix and the tool-call order intact; "in_place" keeps the branch
- *   position. Omitted entries default to "tail", present ones to "in_place"
+ *   position. Omitted entries default to "tail"; present ones keep their canonical placement, so
+ *   a `position: "tail"` message stays at the tail. `priority` orders the eviction of an omitted
+ *   entry brought back; a present entry keeps its declared priority
  */
 export type ProjectionDecision =
 	| "default"
@@ -41,10 +45,12 @@ export type ProjectionDecision =
 	| { include: true; priority?: number; placement?: "tail" | "in_place" };
 
 export interface ProjectionEntryInfo {
-	/** The entry contributes nothing to the canonical projection although it has content. */
-	omitted: boolean;
+	/** Why the entry contributes nothing to the canonical projection although it has content. */
+	omitted?: OmittedReason;
 	/** Estimated tokens of the entry's content. */
 	tokens: number;
+	/** Annotations resolved for the entry over the branch, or `{}`. */
+	annotations: Record<FieldKey, JsonValue>;
 }
 
 export type ProjectionFilter = (entry: ProjectedSessionEntry, info: ProjectionEntryInfo) => ProjectionDecision;
@@ -54,8 +60,11 @@ export interface ProjectedContext {
 	/** Estimated tokens of `messages`, from the baseline and the estimated difference. */
 	tokens: number;
 	budget: ContextBudget;
-	/** Additions dropped to stay under the threshold, lowest priority and oldest first. */
-	evicted: { entry: ProjectedSessionEntry; tokens: number }[];
+	/**
+	 * Contributions dropped to stay under the threshold: additions first, then canonical content
+	 * with a declared priority; lowest priority and oldest first within each kind.
+	 */
+	evicted: { entry: ProjectedSessionEntry; tokens: number; kind: "addition" | "canonical" }[];
 }
 
 export const CONTEXT_RECALL_TYPE = "context_recall";
@@ -64,13 +73,20 @@ export function completeBudget(budget: Omit<ContextBudget, "available">): Contex
 	return { ...budget, available: budget.contextWindow - budget.reserveTokens - budget.baselineTokens };
 }
 
-interface Addition {
+/** One entry's part of the copy. Evictable when `priority` is set; evicted ones lose their messages. */
+interface Contribution {
 	index: number;
 	entry: ProjectedSessionEntry;
 	messages: AgentMessage[];
-	tokens: number;
-	priority: number;
+	/** Eviction order: the filter's for an addition, the entry's declared one for canonical content. */
+	priority?: number;
 	placement: "tail" | "in_place";
+	/** An addition brings an omitted entry back; canonical content is a present entry's, in place or re-sent. */
+	kind: "addition" | "canonical";
+}
+
+function isEvictable(contribution: Contribution): contribution is Contribution & { priority: number } {
+	return contribution.priority !== undefined && contribution.messages.length > 0;
 }
 
 function contentBlocks(message: AgentMessage): (TextContent | ImageContent)[] {
@@ -99,23 +115,49 @@ function recallMessage(entry: ProjectedSessionEntry, messages: AgentMessage[]): 
 		customType: CONTEXT_RECALL_TYPE,
 		content,
 		display: false,
-		details: { entryId: entry.sourceEntry.id },
+		ref: entry.sourceEntry.id,
 		timestamp: Date.now(),
 	};
 }
 
-/** Drop tool results whose call is not in the assistant message they follow. */
-function dropOrphanedToolResults(messages: AgentMessage[]): AgentMessage[] {
+/**
+ * Keep each tool-call group contiguous: an assistant message's calls, then their results. A result
+ * whose call is not in the open group is dropped. Any other message inside an open group (sessions
+ * recorded before #8537 put custom messages there) moves after the group's results, so nothing
+ * else is dropped. Only an assistant or user message closes a group.
+ */
+function orderToolCallGroups(messages: AgentMessage[]): AgentMessage[] {
+	const ordered: AgentMessage[] = [];
 	let openCalls = new Set<string>();
-	return messages.filter((message) => {
-		if (message.role === "assistant") {
-			openCalls = new Set(message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : [])));
-			return true;
+	let unanswered = new Set<string>();
+	let deferred: AgentMessage[] = [];
+	const flush = () => {
+		ordered.push(...deferred);
+		deferred = [];
+	};
+	for (const message of messages) {
+		if (message.role === "assistant" || message.role === "user") {
+			flush();
+			const calls =
+				message.role === "assistant"
+					? message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : []))
+					: [];
+			openCalls = new Set(calls);
+			unanswered = new Set(calls);
+			ordered.push(message);
+		} else if (message.role === "toolResult") {
+			if (!openCalls.has(message.toolCallId)) continue;
+			ordered.push(message);
+			unanswered.delete(message.toolCallId);
+			if (unanswered.size === 0) flush();
+		} else if (unanswered.size > 0) {
+			deferred.push(message);
+		} else {
+			ordered.push(message);
 		}
-		if (message.role === "toolResult") return openCalls.has(message.toolCallId);
-		openCalls = new Set();
-		return true;
-	});
+	}
+	flush();
+	return ordered;
 }
 
 export function projectContext(
@@ -123,82 +165,83 @@ export function projectContext(
 	budget: Omit<ContextBudget, "available">,
 	filter?: ProjectionFilter,
 ): ProjectedContext {
-	const threshold = budget.contextWindow - budget.reserveTokens;
+	// A model without a known window never evicts, as the session never compacts for it either.
+	const threshold = budget.contextWindow > 0 ? budget.contextWindow - budget.reserveTokens : Infinity;
 	const fullBudget = completeBudget(budget);
-	const kept: AgentMessage[][] = [];
-	const moved: Addition[] = [];
-	const additions: Addition[] = [];
+	const contributions: Contribution[] = [];
 	let tokens = budget.baselineTokens;
 
 	projection.entries.forEach((entry, index) => {
-		// A superseded compaction summary is stale, not omitted; it is never offered to the filter.
+		// Canonical tail messages keep their request position after everything else.
+		const tail = entry.sourceEntry.type === "custom_message" && entry.sourceEntry.position === "tail";
+		const canonical: Contribution = {
+			index,
+			entry,
+			messages: entry.messages,
+			priority: entry.priority,
+			placement: tail ? "tail" : "in_place",
+			kind: "canonical",
+		};
+		// A superseded compaction summary is stale, not omitted, and the live one is the checkpoint
+		// the copy starts from: neither is offered to the filter or evicted.
 		if (entry.sourceEntry.type === "compaction") {
-			kept.push(entry.messages);
+			contributions.push({ ...canonical, priority: undefined });
 			return;
 		}
-		const source = entry.messages.length === 0 ? sessionEntryToContextMessages(entry.sourceEntry) : entry.messages;
-		const omitted = entry.messages.length === 0 && source.length > 0;
-		const decision = filter?.(entry, { omitted, tokens: estimateMessagesTokens(source) }) ?? "default";
+		const source = entry.omitted ? sessionEntryToContextMessages(entry.sourceEntry) : entry.messages;
+		const decision =
+			filter?.(entry, {
+				omitted: entry.omitted,
+				tokens: estimateMessagesTokens(source),
+				annotations: projection.annotations.get(entry.sourceEntry.id) ?? {},
+			}) ?? "default";
 		if (decision === "omit") {
 			tokens -= estimateMessagesTokens(entry.messages);
-			kept.push([]);
 			return;
 		}
 		if (decision === "default" || source.length === 0) {
-			// Canonical tail messages keep their request position after everything else.
-			if (entry.sourceEntry.type === "custom_message" && entry.sourceEntry.position === "tail") {
-				kept.push([]);
-				moved.push({ index, entry, messages: entry.messages, tokens: 0, priority: 0, placement: "tail" });
-			} else {
-				kept.push(entry.messages);
-			}
+			contributions.push(canonical);
 			return;
 		}
-		const placement = decision.placement ?? (omitted ? "tail" : "in_place");
+		if (!entry.omitted && decision.placement !== "tail") {
+			// A present entry keeps its canonical placement unless asked to move; "in_place" moves a
+			// tail message into its branch position.
+			contributions.push(decision.placement === "in_place" ? { ...canonical, placement: "in_place" } : canonical);
+			return;
+		}
+		// An omitted entry comes back at the tail by default; a present one is only re-sent there.
+		const placement = decision.placement ?? "tail";
 		const recalled = placement === "tail" ? recallMessage(entry, source) : undefined;
 		const messages = placement === "tail" ? (recalled ? [recalled] : []) : source;
-		const addition: Addition = {
-			index,
-			entry,
-			messages,
-			tokens: estimateMessagesTokens(messages),
-			priority: decision.priority ?? 0,
-			placement,
-		};
-		if (omitted) {
-			kept.push([]);
-			additions.push(addition);
-			tokens += addition.tokens;
-		} else if (placement === "tail") {
-			kept.push([]);
-			moved.push(addition);
-			tokens += addition.tokens - estimateMessagesTokens(entry.messages);
+		if (entry.omitted) {
+			contributions.push({ index, entry, messages, priority: decision.priority ?? 0, placement, kind: "addition" });
+			tokens += estimateMessagesTokens(messages);
 		} else {
-			kept.push(entry.messages);
+			// A present entry re-sent at the tail is still its canonical content, under its own priority.
+			contributions.push({ ...canonical, messages, placement: "tail" });
+			tokens += estimateMessagesTokens(messages) - estimateMessagesTokens(entry.messages);
 		}
 	});
 
 	const evicted: ProjectedContext["evicted"] = [];
-	while (tokens > threshold && additions.length > 0) {
-		let victim = 0;
-		for (let i = 1; i < additions.length; i++) {
-			const a = additions[i];
-			const b = additions[victim];
-			if (a.priority < b.priority || (a.priority === b.priority && a.index < b.index)) victim = i;
+	for (const kind of ["addition", "canonical"] as const) {
+		const candidates = contributions
+			.filter(isEvictable)
+			.filter((contribution) => contribution.kind === kind)
+			.sort((a, b) => a.priority - b.priority || a.index - b.index);
+		for (const candidate of candidates) {
+			if (tokens <= threshold) break;
+			const cost = estimateMessagesTokens(candidate.messages);
+			tokens -= cost;
+			candidate.messages = [];
+			evicted.push({ entry: candidate.entry, tokens: cost, kind });
 		}
-		const [dropped] = additions.splice(victim, 1);
-		tokens -= dropped.tokens;
-		evicted.push({ entry: dropped.entry, tokens: dropped.tokens });
 	}
 
-	for (const addition of additions) {
-		if (addition.placement === "in_place") kept[addition.index] = addition.messages;
-	}
-	const tail = [...moved, ...additions.filter((addition) => addition.placement === "tail")]
-		.sort((a, b) => a.index - b.index)
-		.flatMap((addition) => addition.messages);
-	const ordered = [...kept.flat(), ...tail];
-	const messages = dropOrphanedToolResults(ordered);
+	const inPlace = contributions.filter((contribution) => contribution.placement === "in_place");
+	const tail = contributions.filter((contribution) => contribution.placement === "tail");
+	const ordered = [...inPlace, ...tail].flatMap((contribution) => contribution.messages);
+	const messages = orderToolCallGroups(ordered);
 	return {
 		messages,
 		tokens: tokens - estimateMessagesTokens(ordered) + estimateMessagesTokens(messages),

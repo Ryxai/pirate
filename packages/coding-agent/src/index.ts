@@ -70,6 +70,7 @@ export type {
 	AgentStartEvent,
 	AgentToolResult,
 	AgentToolUpdateCallback,
+	AnnotationEntryDraft,
 	AppKeybinding,
 	AutocompleteProviderFactory,
 	BashToolCallEvent,
@@ -121,6 +122,8 @@ export type {
 	ExtensionUIDialogOptions,
 	ExtensionVirtualModel,
 	ExtensionWidgetOptions,
+	FieldHolder,
+	FieldSpec,
 	FindToolCallEvent,
 	GrepToolCallEvent,
 	InlineExtension,
@@ -228,7 +231,16 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
-export { type ContextExpiry, type ContextVisibility, type CustomMessageInput, convertToLlm } from "./core/messages.ts";
+export {
+	type ContextExpiry,
+	type ContextVisibility,
+	type CustomMessageInput,
+	convertToLlm,
+	type FieldKey,
+	fieldKey,
+	getField,
+	listFields,
+} from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
 	type ModelScopeDiagnostic,
@@ -286,6 +298,7 @@ export {
 	type PromptTemplate,
 } from "./core/sdk.ts";
 export {
+	type AnnotationEntry,
 	type BranchSummaryEntry,
 	buildContextEntries,
 	buildSessionContext,
@@ -301,6 +314,7 @@ export {
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	type NewSessionOptions,
+	type OmittedReason,
 	type ProjectedSessionEntry,
 	parseSessionEntries,
 	type SessionContext,
