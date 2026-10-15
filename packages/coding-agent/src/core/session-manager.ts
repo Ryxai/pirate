@@ -182,8 +182,10 @@ export type ContextEditableContent =
 export interface ContextEditEntry extends SessionEntryBase {
 	type: "context_edit";
 	targetId: string;
-	/** Null omits the target from model context. A value replaces only its content. */
-	replacement: { content: ContextEditableContent } | null;
+	/** Null omits the target from model context. A value replaces only its content. "source" restores it. */
+	replacement: { content: ContextEditableContent } | "source" | null;
+	/** Lifetime of this edit's contribution, counted from the edit (see CustomMessageVisibility). */
+	visibility?: CustomMessageVisibility;
 }
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
@@ -533,7 +535,7 @@ export function buildContextEntries(
  */
 function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undefined): AgentMessage[] {
 	const messages = sessionEntryToContextMessages(entry);
-	if (!edit) return messages;
+	if (!edit || edit.replacement === "source") return messages;
 	const replacement = edit.replacement;
 	if (replacement === null) return [];
 
@@ -554,10 +556,11 @@ function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undef
 	});
 }
 
-/** A custom message with visibility, waiting for the entry that ends it. */
+/** A contribution with visibility, waiting for the entry that ends it. */
 interface PendingExpiry {
-	entry: CustomMessageEntry;
-	/** Assistant messages seen since the custom message. */
+	targetId: string;
+	visibility: CustomMessageVisibility;
+	/** Assistant messages seen since the contribution started. */
 	assistantMessages: number;
 }
 
@@ -578,25 +581,35 @@ function matchesExpiry(until: CustomMessageExpiry, entry: SessionEntry, assistan
 }
 
 function endsVisibility(pending: PendingExpiry, entry: SessionEntry): boolean {
-	const { until, key } = pending.entry.visibility!;
+	const { until, key } = pending.visibility;
 	if (key !== undefined && entry.type === "custom_message" && entry.visibility?.key === key) return true;
 	return until !== undefined && matchesExpiry(until, entry, pending.assistantMessages);
 }
 
-/** Index on `path` of the entry that ends each custom message's visibility, for the messages that have one. */
-function findCustomMessageExpiries(path: SessionEntry[]): Map<string, number> {
+/**
+ * Index on `path` of the entry that ends each bounded contribution, keyed by target entry id.
+ * A custom message with visibility starts one; a context edit on a target replaces its pending
+ * contribution and starts a new one when the edit carries visibility.
+ */
+function findExpiries(path: SessionEntry[]): Map<string, number> {
 	const expiries = new Map<string, number>();
-	const pending: PendingExpiry[] = [];
+	let pending: PendingExpiry[] = [];
 	path.forEach((entry, index) => {
 		const isAssistant = entry.type === "message" && entry.message.role === "assistant";
 		for (let i = pending.length - 1; i >= 0; i--) {
 			if (isAssistant) pending[i].assistantMessages++;
 			if (endsVisibility(pending[i], entry)) {
-				expiries.set(pending[i].entry.id, index);
+				expiries.set(pending[i].targetId, index);
 				pending.splice(i, 1);
 			}
 		}
-		if (entry.type === "custom_message" && entry.visibility) pending.push({ entry, assistantMessages: 0 });
+		if (entry.type === "custom_message" && entry.visibility) {
+			pending.push({ targetId: entry.id, visibility: entry.visibility, assistantMessages: 0 });
+		} else if (entry.type === "context_edit") {
+			pending = pending.filter((item) => item.targetId !== entry.targetId);
+			if (entry.visibility)
+				pending.push({ targetId: entry.targetId, visibility: entry.visibility, assistantMessages: 0 });
+		}
 	});
 	return expiries;
 }
@@ -615,11 +628,12 @@ export function buildSessionProjection(
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
 	const pathIndex = new Map(path.map((entry, index) => [entry.id, index]));
-	const expiries = findCustomMessageExpiries(path);
+	const expiries = findExpiries(path);
 	const projectedEntries = contextEntries.map((sourceEntry, index): ProjectedSessionEntry => {
 		const edit = edits.get(sourceEntry.id);
 		const expiry = expiries.get(sourceEntry.id);
 		// An expiry is an implicit omission at the ending entry; an edit appended later overrides it.
+		// An edit with its own visibility expires after itself, so the comparison keeps it omitted.
 		const expired = expiry !== undefined && (edit === undefined || (pathIndex.get(edit.id) ?? -1) < expiry);
 		return {
 			sourceEntry,
@@ -1431,15 +1445,24 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	/** Append a branch-local edit to an earlier model-visible entry. */
-	appendContextEdit(targetId: string, replacement: ContextEditEntry["replacement"]): string {
+	/**
+	 * Append a branch-local edit to an earlier model-visible entry.
+	 * @param replacement Null omits the target, "source" restores its original content, a value replaces the content
+	 * @param visibility Optional lifetime of the edit's contribution, counted from the edit
+	 */
+	appendContextEdit(
+		targetId: string,
+		replacement: ContextEditEntry["replacement"],
+		visibility?: CustomMessageVisibility,
+	): string {
 		if (
 			replacement !== null &&
+			replacement !== "source" &&
 			(typeof replacement !== "object" ||
 				!("content" in replacement) ||
 				(typeof replacement.content !== "string" && !Array.isArray(replacement.content)))
 		) {
-			throw new Error("Context edit replacement must be null or contain string/array content");
+			throw new Error('Context edit replacement must be null, "source", or contain string/array content');
 		}
 		const target = this.byId.get(targetId);
 		if (!target) throw new Error(`Entry ${targetId} not found`);
@@ -1456,6 +1479,7 @@ export class SessionManager {
 		const targetRole = target.type === "message" ? target.message.role : "custom";
 		const normalizedReplacement =
 			replacement !== null &&
+			replacement !== "source" &&
 			(targetRole === "assistant" || targetRole === "toolResult") &&
 			typeof replacement.content === "string"
 				? { content: [{ type: "text" as const, text: replacement.content }] }
@@ -1467,6 +1491,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			targetId,
 			replacement: normalizedReplacement,
+			...(visibility ? { visibility } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;

@@ -163,12 +163,11 @@ describe("custom message visibility", () => {
 		]);
 	});
 
-	it("lets a context edit appended after the expiry point override it", () => {
+	it("lets the latest context edit replace the target's visibility", () => {
 		const session = SessionManager.inMemory();
 		const id = session.appendCustomMessageEntry("prelude", "think first", false, undefined, {
 			until: "assistant_message",
 		});
-		session.appendContextEdit(id, { content: "edited before expiry" });
 		session.appendMessage(assistant("answer"));
 		expect(projectedRoles(session)).toEqual(["assistant"]);
 
@@ -180,6 +179,18 @@ describe("custom message visibility", () => {
 
 		session.appendContextEdit(id, null);
 		expect(projectedRoles(session)).toEqual(["assistant"]);
+
+		// An edit before the expiry point replaces the pending visibility: the contribution is permanent.
+		const second = SessionManager.inMemory();
+		const boundedId = second.appendCustomMessageEntry("prelude", "think first", false, undefined, {
+			until: "assistant_message",
+		});
+		second.appendContextEdit(boundedId, { content: "edited before expiry" });
+		second.appendMessage(assistant("answer"));
+		expect(second.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual([
+			"edited before expiry",
+			"",
+		]);
 	});
 
 	it("projects tail messages after every other message", () => {
@@ -193,5 +204,56 @@ describe("custom message visibility", () => {
 		expect(projection.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "custom"]);
 		expect(projection.entries.map((entry) => entry.sourceEntry.id).at(-1)).toBe(tailId);
 		expect(session.getEntry(tailId)).toMatchObject({ position: "tail" });
+	});
+
+	it("restores the source content with a source edit", () => {
+		const session = SessionManager.inMemory();
+		const id = session.appendCustomMessageEntry("note", "original", false);
+		session.appendContextEdit(id, { content: "replaced" });
+		session.appendContextEdit(id, "source");
+		expect(session.buildSessionProjection().messages.map((message) => getCustomText(message))).toEqual(["original"]);
+
+		const resultId = session.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "file contents" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		session.appendContextEdit(resultId, null);
+		expect(projectedRoles(session)).toEqual(["custom"]);
+		session.appendContextEdit(resultId, "source");
+		expect(projectedRoles(session)).toEqual(["custom", "toolResult"]);
+	});
+
+	it("bounds a restoring edit by its own visibility", () => {
+		const session = SessionManager.inMemory();
+		const id = session.appendCustomMessageEntry("prelude", "think first", false, undefined, {
+			until: "assistant_message",
+		});
+		session.appendMessage(assistant("answer"));
+		session.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+		expect(projectedRoles(session)).toEqual(["assistant", "user"]);
+
+		session.appendContextEdit(id, "source", { until: "assistant_message" });
+		expect(projectedRoles(session)).toEqual(["custom", "assistant", "user"]);
+
+		session.appendMessage(assistant("second answer"));
+		expect(projectedRoles(session)).toEqual(["assistant", "user", "assistant"]);
+
+		session.appendContextEdit(id, "source");
+		session.appendMessage(assistant("third answer"));
+		expect(projectedRoles(session)).toEqual(["custom", "assistant", "user", "assistant", "assistant"]);
+	});
+
+	it("replaces a pending expiry when a later edit targets the same entry", () => {
+		const session = SessionManager.inMemory();
+		const id = session.appendCustomMessageEntry("prelude", "think first", false, undefined, {
+			until: "assistant_message",
+		});
+		session.appendContextEdit(id, "source");
+		session.appendMessage(assistant("answer"));
+		expect(projectedRoles(session)).toEqual(["custom", "assistant"]);
 	});
 });

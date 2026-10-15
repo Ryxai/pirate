@@ -963,7 +963,7 @@ export class AgentSession {
 					);
 					break;
 				case "context_edit":
-					entryId = manager.appendContextEdit(draft.targetId, draft.replacement);
+					entryId = manager.appendContextEdit(draft.targetId, draft.replacement, draft.visibility);
 					break;
 				case "compaction": {
 					const tokensBefore = estimateProjectedContextTokens(
@@ -1200,9 +1200,13 @@ export class AgentSession {
 		if (event.type === "turn_end") {
 			this._lastAssistantToolResults = event.toolResults;
 			this._flushPendingCustomMessages();
-			// The turn's assistant message may end an earlier custom message's visibility; the
-			// finalized transcript drops it now, as the next request's projection will.
-			if (this.sessionManager.getBranch().some((entry) => entry.type === "custom_message" && entry.visibility)) {
+			// The turn's assistant message may end an earlier bounded contribution; the finalized
+			// transcript drops it now, as the next request's projection will.
+			if (
+				this.sessionManager
+					.getBranch()
+					.some((entry) => (entry.type === "custom_message" || entry.type === "context_edit") && entry.visibility)
+			) {
 				this._refreshFinalizedContext();
 			}
 		}

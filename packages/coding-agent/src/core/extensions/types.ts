@@ -989,6 +989,7 @@ export interface ContextEditEntryDraft {
 	type: "context_edit";
 	targetId: string;
 	replacement: ContextEditEntry["replacement"];
+	visibility?: CustomMessageVisibility;
 }
 
 export interface CompactionEntryDraft {

@@ -12,7 +12,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { SessionTreeNode } from "../../../core/session-manager.ts";
+import type { ContextEditEntry, SessionTreeNode } from "../../../core/session-manager.ts";
 import { formatReadLineRange } from "../../../core/tools/render-utils.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -60,6 +60,10 @@ const MAX_ANCHOR_CONTEXT_WIDTH = 12;
  * when the selected row's anchor (the start of its entry text after tree
  * indentation/markers) would otherwise be too far right to see useful content.
  */
+function contextEditLabel(entry: ContextEditEntry): string {
+	return entry.replacement === null ? "omit" : entry.replacement === "source" ? "restore" : "replace";
+}
+
 function renderHorizontalViewport(rows: HorizontalViewportRow[], width: number): string[] {
 	const viewportWidth = Math.max(0, width - TREE_GUTTER_WIDTH);
 	const maxBodyWidth = rows.reduce((max, row) => Math.max(max, row.bodyWidth), 0);
@@ -610,7 +614,7 @@ class TreeList implements Component {
 				parts.push("custom", entry.customType);
 				break;
 			case "context_edit":
-				parts.push("context edit", entry.replacement === null ? "omit" : "replace", entry.targetId);
+				parts.push("context edit", contextEditLabel(entry), entry.targetId);
 				break;
 			case "label":
 				parts.push("label", entry.label ?? "");
@@ -843,7 +847,7 @@ class TreeList implements Component {
 				result = theme.fg("dim", `[custom: ${entry.customType}]`);
 				break;
 			case "context_edit":
-				result = theme.fg("dim", `[context ${entry.replacement === null ? "omit" : "replace"}: ${entry.targetId}]`);
+				result = theme.fg("dim", `[context ${contextEditLabel(entry)}: ${entry.targetId}]`);
 				break;
 			case "label":
 				result = theme.fg("dim", `[label: ${entry.label ?? "(cleared)"}]`);

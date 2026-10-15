@@ -119,7 +119,7 @@ Handlers are awaited in stream order, so slow handlers delay stream consumption.
 
 <a id="message-visibility"></a>
 
-A custom message normally stays in model context for the rest of the branch. `visibility` bounds that: the message is persisted like any other, but `buildSessionProjection()` omits it once an entry that ends it follows it on the branch. `until` names that entry: `"assistant_message"` sends the message with one request and drops it once the model has answered; `"user_message"` keeps it through the tool-call turns of the current run; `"compaction"` drops it at the next compaction; `{ assistantMessages: n }` drops it after the n-th response; `{ customType }` drops it once a custom entry or custom message of that type follows, so an orchestrator ends a phase with `pi.appendEntry()`. `key` makes a later custom message with the same key supersede the earlier one, for state that is re-sent each turn. The conditions are evaluated over session entries, so they hold after resume and on every branch, and a `context_edit` appended after the expiry point overrides it. Use it for content that should steer one response without staying in the transcript, such as reasoning produced by another model before the main request:
+A custom message normally stays in model context for the rest of the branch. `visibility` bounds that: the message is persisted like any other, but `buildSessionProjection()` omits it once an entry that ends it follows it on the branch. `until` names that entry: `"assistant_message"` sends the message with one request and drops it once the model has answered; `"user_message"` keeps it through the tool-call turns of the current run; `"compaction"` drops it at the next compaction; `{ assistantMessages: n }` drops it after the n-th response; `{ customType }` drops it once a custom entry or custom message of that type follows, so an orchestrator ends a phase with `pi.appendEntry()`. `key` makes a later custom message with the same key supersede the earlier one, for state that is re-sent each turn. The conditions are evaluated over session entries, so they hold after resume and on every branch, and a later `context_edit` on the message replaces its visibility. Use it for content that should steer one response without staying in the transcript, such as reasoning produced by another model before the main request:
 
 ```typescript
 pi.on("before_agent_start", async (event, ctx) => {
@@ -133,7 +133,7 @@ pi.on("before_agent_start", async (event, ctx) => {
 });
 ```
 
-`position: "tail"` projects the message after every other message of the request, whatever its branch position. Combined with `key`, it carries state the model should always see last, such as the current git status, without moving the cached prefix. An expired or superseded message elsewhere changes the request prefix, so the next request misses the prompt cache once.
+To show an omitted or expired entry again, append a `context_edit` with `replacement: "source"`; give the edit its own `visibility` to bound how long it stays. This works for any editable entry, so an extension can bring back an earlier tool result for one response. `position: "tail"` projects a custom message after every other message of the request, whatever its branch position. Combined with `key`, it carries state the model should always see last, such as the current git status, without moving the cached prefix. An expired or superseded message elsewhere changes the request prefix, so the next request misses the prompt cache once.
 
 <a id="cache_warming_decision"></a>
 
