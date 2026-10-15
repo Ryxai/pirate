@@ -2,7 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
@@ -13,6 +13,7 @@ import {
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
+import type { ContextBudget, ProjectedContext } from "../context-projection.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
@@ -66,6 +67,7 @@ import type {
 	MessageEndEvent,
 	MessageEndEventResult,
 	MessageRenderer,
+	ProjectContextOptions,
 	ProjectTrustContext,
 	ProjectTrustEvent,
 	ProjectTrustEventResult,
@@ -221,6 +223,13 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 				: undefined;
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
+
+/** The provider request being prepared, as `context` handlers see it. */
+export interface ExtensionRequest {
+	model: Model<any>;
+	thinkingLevel: ThinkingLevel;
+	budget: ContextBudget;
+}
 
 type BoundaryBaseEvent =
 	| Omit<TurnEndEvent, "entries" | "continue" | "context">
@@ -379,6 +388,10 @@ export class ExtensionRunner {
 	private abortFn: () => void = () => {};
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
+	private projectContextFn: (options: ProjectContextOptions) => ProjectedContext = () => {
+		throw new Error("Context projection is not available in this mode");
+	};
+	private request: ExtensionRequest | undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
@@ -453,6 +466,7 @@ export class ExtensionRunner {
 		this.hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.shutdownHandler = contextActions.shutdown;
 		this.getContextUsageFn = contextActions.getContextUsage;
+		this.projectContextFn = contextActions.projectContext;
 		this.compactFn = contextActions.compact;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
 		this.getSystemPromptOptionsFn =
@@ -746,6 +760,11 @@ export class ExtensionRunner {
 		return () => this.errorListeners.delete(listener);
 	}
 
+	/** Set the request that `context` handlers run for; undefined outside a request. */
+	setRequest(request: ExtensionRequest | undefined): void {
+		this.request = request;
+	}
+
 	emitError(error: ExtensionError): void {
 		for (const listener of this.errorListeners) {
 			listener(error);
@@ -949,6 +968,10 @@ export class ExtensionRunner {
 			getContextUsage: () => {
 				runner.assertActive();
 				return runner.getContextUsageFn();
+			},
+			projectContext: (options) => {
+				runner.assertActive();
+				return runner.projectContextFn(options);
 			},
 			compact: (options) => {
 				runner.assertActive();
@@ -1305,13 +1328,18 @@ export class ExtensionRunner {
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
 		const ctx = this.createContext();
 		let currentMessages = structuredClone(messages);
+		const request = {
+			model: this.request?.model ?? this.getModel(),
+			thinkingLevel: this.request?.thinkingLevel,
+			budget: this.request?.budget,
+		};
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "context")) {
 			for (const handler of handlers) {
 				try {
 					const visibleMessages = currentMessages.filter((message) => message.role !== "system");
 					const visibleSnapshot = visibleMessages.slice();
-					const event: ContextEvent = { type: "context", messages: visibleMessages };
+					const event: ContextEvent = { type: "context", messages: visibleMessages, ...request };
 					const handlerResult = (await handler(event, ctx)) as ContextEventResult | undefined;
 
 					// Handlers may return a new list or edit event.messages in place.
@@ -1337,7 +1365,11 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				try {
 					const hadLeadingSystemMessage = currentMessages[0]?.role === "system";
-					const event: ContextWithSystemEvent = { type: "context_with_system", messages: currentMessages };
+					const event: ContextWithSystemEvent = {
+						type: "context_with_system",
+						messages: currentMessages,
+						...request,
+					};
 					const handlerResult = (await handler(event, ctx)) as ContextEventResult | undefined;
 					currentMessages = handlerResult?.messages ?? currentMessages;
 					// Providers read the prompt and initial tools from the leading system message.

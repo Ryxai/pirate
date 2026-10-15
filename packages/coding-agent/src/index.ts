@@ -49,6 +49,14 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./core/compaction/index.ts";
+export {
+	type ContextBudget,
+	type ProjectedContext,
+	type ProjectionDecision,
+	type ProjectionEntryInfo,
+	type ProjectionFilter,
+	projectContext,
+} from "./core/context-projection.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system
 export type {
@@ -134,6 +142,7 @@ export type {
 	ModelSelectSource,
 	NormalizedBuildSystemPromptOptions,
 	PowerShellToolCallEvent,
+	ProjectContextOptions,
 	ProjectTrustContext,
 	ProjectTrustEvent,
 	ProjectTrustEventDecision,

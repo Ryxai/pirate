@@ -113,7 +113,7 @@ Handlers are awaited in stream order, so slow handlers delay stream consumption.
 
 <a id="context_with_system"></a>
 
-`context` transforms conversation messages without prompt and tool system messages; Pi restores that state afterward. Use `context_with_system` only when a request-local transformation must own the complete transcript, and keep a system message at index zero.
+`context` transforms conversation messages without prompt and tool system messages; Pi restores that state afterward. Use `context_with_system` only when a request-local transformation must own the complete transcript, and keep a system message at index zero. Both events carry the request's `model` (the physical model after virtual-model routing), `thinkingLevel`, and `budget`, the token headroom under the compaction threshold. See [Context projection](#context-projection) for deriving the request's copy from the session branch.
 
 `turn_end` and `agent_before_settle` are actionable boundaries. Their handlers can chain proposed `custom`, `custom_message`, `context_edit`, or `compaction` entries and return `continue: true` for one next model request. Guard continuation conditions because an unconditional continuation can loop. Use the exported event declarations for the complete validation and ordering contract.
 
@@ -134,6 +134,26 @@ pi.on("before_agent_start", async (event, ctx) => {
 ```
 
 To show an omitted or expired entry again, append a `context_edit` with `replacement: "source"`; give the edit its own `visibility` to bound how long it stays. This works for any editable entry, so an extension can bring back an earlier tool result for one response. `position: "tail"` projects a custom message after every other message of the request, whatever its branch position. Combined with `key`, it carries state the model should always see last, such as the current git status, without moving the cached prefix. An expired or superseded message elsewhere changes the request prefix, so the next request misses the prompt cache once.
+
+<a id="context-projection"></a>
+
+`ctx.projectContext({ model, filter })` projects the session branch into the messages one model sees. The filter runs once per projected entry, including entries that are omitted by a `context_edit` or an expired `visibility`, and returns `"default"` (the canonical contribution, so an omitted entry stays out), `"omit"`, or `{ include: true, priority?, placement? }`. Including an omitted entry re-sends its content at the tail as a `context_recall` custom message by default, which keeps the cached prefix and the tool-call order intact; `placement: "in_place"` puts it back at its branch position instead. The result carries the messages, an estimated token count, the budget, and the additions evicted to stay under the compaction threshold, lowest `priority` first and oldest next. Canonical messages are never evicted. A `context` handler returns the copy for the main request; an extension that calls other models builds one copy per model:
+
+```typescript
+pi.on("context", (event, ctx) => {
+  if (!event.model) return;
+  const copy = ctx.projectContext({
+    model: event.model,
+    filter: (entry, info) =>
+      info.omitted && entry.sourceEntry.type === "custom_message" && entry.sourceEntry.customType === "prelude"
+        ? { include: true, priority: 1 }
+        : "default",
+  });
+  return { messages: copy.messages.filter((message) => message.role !== "system") };
+});
+```
+
+The compaction threshold is checked on the canonical projection before `context` handlers run, and compacting from a handler would abort the request. A handler that grows the request past the threshold is reported as an extension error and the request is sent as is; overflow recovery compacts if the provider rejects it. Right before compaction `budget.available` is zero or negative, so a filter that needs room should compact from `turn_end` instead. Each distinct copy is its own prompt-cache prefix: different models have separate caches, but two filters alternating on one model miss the cache on every request.
 
 <a id="cache_warming_decision"></a>
 

@@ -106,6 +106,9 @@ describe("ExtensionRunner", () => {
 		hasPendingMessages: () => false,
 		shutdown: () => {},
 		getContextUsage: () => undefined,
+		projectContext: () => {
+			throw new Error("not available");
+		},
 		compact: () => {},
 		getSystemPrompt: () => "",
 		getScopedModels: () => [],

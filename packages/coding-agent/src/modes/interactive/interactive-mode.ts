@@ -2264,6 +2264,7 @@ export class InteractiveMode {
 				this.shutdownRequested = true;
 			},
 			getContextUsage: () => this.session.getContextUsage(),
+			projectContext: (options) => this.session.projectContext(options),
 			compact: (options) => {
 				void (async () => {
 					try {

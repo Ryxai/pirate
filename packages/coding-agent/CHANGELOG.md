@@ -7,6 +7,7 @@
 - Changing the thinking level mid-session on OpenAI GPT-6 models (API key) now keeps the prompt cache ([#10853](https://github.com/earendil-works/pi/issues/10853))
 - Added `visibility` and `position` to custom messages: `pi.sendMessage()` and `custom_message` boundary drafts accept `visibility: { until?, key? }` and `position: "tail"`. The session projection omits the message once a matching entry follows it on the branch or a later message with the same key supersedes it, and projects tail messages last. See [Message visibility](docs/extensions.md#message-visibility)
 - Added `replacement: "source"` and an optional `visibility` to `context_edit` entries, so an omitted or expired entry can be shown again, for a bounded time if wanted
+- Added `ctx.projectContext()` to derive one model's copy of a request from the session branch, with omitted entries recalled at the tail or in place, priorities, and eviction under the compaction threshold. `context` and `context_with_system` events now carry the routed `model`, `thinkingLevel`, and `budget`, and a handler that grows the request past the threshold is reported as an extension error. See [Context projection](docs/extensions.md#context-projection)
 
 ### Fixed
 

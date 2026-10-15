@@ -128,6 +128,7 @@ export type {
 	NormalizedBuildSystemPromptOptions,
 	PowerShellToolCallEvent,
 	PowerShellToolResultEvent,
+	ProjectContextOptions,
 	ProjectTrustContext,
 	ProjectTrustEvent,
 	ProjectTrustEventDecision,

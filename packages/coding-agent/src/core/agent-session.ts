@@ -77,6 +77,7 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
+import { type ContextBudget, completeBudget, type ProjectedContext, projectContext } from "./context-projection.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -94,6 +95,7 @@ import {
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
+	type ProjectContextOptions,
 	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
@@ -404,6 +406,8 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	/** Budget of the request being prepared, for `context` handlers and the overage report. */
+	private _requestBudget: ContextBudget | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -518,6 +522,7 @@ export class AgentSession {
 		this._installAgentBoundaryHooks();
 		this._installHiddenDeclarationsProjection();
 		this._installAgentForcedPromptProjection();
+		this._installContextBudgetGuard();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -812,7 +817,10 @@ export class AgentSession {
 			let { previous, context, projection } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
-			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
+			if (!isVirtualModel(model)) {
+				this._setExtensionRequest(model, thinkingLevel, projection);
+				return { ...previous, context, model, thinkingLevel };
+			}
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
 			// failure rejects, which ends the run with an error response. Only messages the user wrote
@@ -838,10 +846,54 @@ export class AgentSession {
 			// the projection.
 			if (this._exceedsCompactionThreshold(route.model, projection)) {
 				await this._runAutoCompaction("threshold", false);
-				({ previous, context } = await prepare());
+				({ previous, context, projection } = await prepare());
 			}
+			this._setExtensionRequest(route.model, route.thinkingLevel, projection);
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
+	}
+
+	private _contextBudget(model: Model<any>, projection: SessionProjection): Omit<ContextBudget, "available"> {
+		return {
+			contextWindow: model.contextWindow,
+			reserveTokens: this.settingsManager.getCompactionSettings(model).reserveTokens,
+			baselineTokens: estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
+		};
+	}
+
+	private _setExtensionRequest(model: Model<any>, thinkingLevel: ThinkingLevel, projection: SessionProjection): void {
+		this._requestBudget = completeBudget(this._contextBudget(model, projection));
+		this._extensionRunner.setRequest({ model, thinkingLevel, budget: this._requestBudget });
+	}
+
+	/**
+	 * Report a request that `context` handlers grew past the compaction threshold. The threshold
+	 * check ran on the canonical projection before the handlers, and compacting here would abort
+	 * the request, so it is sent as is; overflow recovery handles a rejection.
+	 */
+	private _installContextBudgetGuard(): void {
+		const previousTransformContext = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			const budget = this._requestBudget;
+			if (!budget || budget.contextWindow <= 0) return transformed;
+			const threshold = budget.contextWindow - budget.reserveTokens;
+			const tokens = budget.baselineTokens + estimateMessagesTokens(transformed) - estimateMessagesTokens(messages);
+			if (tokens > threshold && budget.baselineTokens <= threshold) {
+				this._extensionRunner.emitError({
+					extensionPath: "<context>",
+					event: "context",
+					error: `context handlers grew the request to about ${tokens} tokens, past the compaction threshold of ${threshold}; sent as is`,
+				});
+			}
+			return transformed;
+		};
+	}
+
+	/** Project the branch into one model's copy of a request. See `projectContext()` in context-projection.ts. */
+	projectContext(options: ProjectContextOptions): ProjectedContext {
+		const projection = this.sessionManager.buildSessionProjection();
+		return projectContext(projection, this._contextBudget(options.model, projection), options.filter);
 	}
 
 	private async _dispatchTurnEndBoundary(
@@ -3498,6 +3550,7 @@ export class AgentSession {
 					this._extensionShutdownHandler?.();
 				},
 				getContextUsage: () => this.getContextUsage(),
+				projectContext: (options) => this.projectContext(options),
 				compact: (options) => {
 					void (async () => {
 						try {

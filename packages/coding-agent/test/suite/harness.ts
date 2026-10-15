@@ -18,7 +18,7 @@ import type {
 import { registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat";
 import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import type { ExtensionRunner, ExtensionUIContext } from "../../src/core/extensions/index.ts";
+import type { ExtensionError, ExtensionRunner, ExtensionUIContext } from "../../src/core/extensions/index.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
@@ -137,6 +137,8 @@ export interface Harness {
 	getPendingResponseCount: () => number;
 	events: AgentSessionEvent[];
 	eventsOfType<T extends AgentSessionEvent["type"]>(type: T): Extract<AgentSessionEvent, { type: T }>[];
+	/** Errors the extension runner reported. */
+	errors: ExtensionError[];
 	tempDir: string;
 	cleanup: () => void;
 }
@@ -248,6 +250,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	session.subscribe((event) => {
 		events.push(event);
 	});
+	const errors: ExtensionError[] = [];
+	extensionRunnerRef.current?.onError((error) => errors.push(error));
 
 	return {
 		session,
@@ -264,6 +268,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		eventsOfType<T extends AgentSessionEvent["type"]>(type: T) {
 			return events.filter((event): event is Extract<AgentSessionEvent, { type: T }> => event.type === type);
 		},
+		errors,
 		tempDir,
 		cleanup() {
 			session.dispose();

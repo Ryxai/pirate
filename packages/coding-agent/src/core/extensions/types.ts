@@ -59,6 +59,7 @@ import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
+import type { ContextBudget, ProjectedContext, ProjectionFilter } from "../context-projection.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
@@ -311,6 +312,13 @@ export interface ContextUsage {
 	percent: number | null;
 }
 
+/** Options of `ctx.projectContext()`. */
+export interface ProjectContextOptions {
+	/** Model the copy is for; sets the budget. */
+	model: Model<any>;
+	filter?: ProjectionFilter;
+}
+
 export interface CompactOptions {
 	customInstructions?: string;
 	onComplete?: (result: CompactionResult) => void;
@@ -358,6 +366,12 @@ export interface ExtensionContext {
 	shutdown(): void;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
+	/**
+	 * Project the session branch into the messages one model sees. Omitted and expired entries can
+	 * be brought back; additions are evicted first when the copy would cross the compaction
+	 * threshold. Use it in `context` handlers for the main request and for an extension's own calls.
+	 */
+	projectContext(options: ProjectContextOptions): ProjectedContext;
 	/** Trigger compaction without awaiting completion. */
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
@@ -885,6 +899,12 @@ export type SessionEvent =
 export interface ContextEvent {
 	type: "context";
 	messages: AgentMessage[];
+	/** Model the request is routed to, or the session model outside a request. */
+	model: Model<any> | undefined;
+	/** Thinking level of the request; undefined outside a request. */
+	thinkingLevel?: ThinkingLevel;
+	/** Token budget of the request against the compaction threshold; undefined outside a request. */
+	budget?: ContextBudget;
 }
 
 /**
@@ -895,6 +915,9 @@ export interface ContextEvent {
 export interface ContextWithSystemEvent {
 	type: "context_with_system";
 	messages: AgentMessage[];
+	model: Model<any> | undefined;
+	thinkingLevel?: ThinkingLevel;
+	budget?: ContextBudget;
 }
 
 /** Fired before a provider request is sent. Can replace the payload. */
@@ -2221,6 +2244,7 @@ export interface ExtensionContextActions {
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
+	projectContext: (options: ProjectContextOptions) => ProjectedContext;
 	compact: (options?: CompactOptions) => void;
 	getSystemPrompt: () => string;
 	getSystemPromptOptions?: () => BuildSystemPromptOptions;

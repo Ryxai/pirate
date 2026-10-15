@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { CONTEXT_RECALL_TYPE } from "../../src/core/context-projection.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 function texts(messages: AgentMessage[]): string[] {
@@ -146,5 +147,90 @@ describe("custom message visibility in agent runs", () => {
 
 		expect(requests[0]).toEqual(["system:", "user:one", "user:status 1"]);
 		expect(requests[1]).toEqual(["system:", "user:one", "assistant:first", "user:two", "user:status 2"]);
+	});
+
+	it("gives context handlers the routed model and budget, and projects a copy on request", async () => {
+		const requests: string[][] = [];
+		const seen: { model?: string; available?: number }[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", () => {
+						pi.sendMessage({
+							customType: "prelude",
+							content: "prelude",
+							display: false,
+							visibility: { until: "assistant_message" },
+						});
+					});
+					pi.on("context", (event, ctx) => {
+						seen.push({ model: event.model?.id, available: event.budget?.available });
+						if (!event.model) return;
+						const copy = ctx.projectContext({
+							model: event.model,
+							filter: (entry, info) =>
+								info.omitted && entry.sourceEntry.type === "custom_message" ? { include: true } : "default",
+						});
+						return { messages: copy.messages.filter((message) => message.role !== "system") };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			(context) => {
+				requests.push(texts(context.messages));
+				return fauxAssistantMessage("first");
+			},
+			(context) => {
+				requests.push(texts(context.messages));
+				return fauxAssistantMessage("second");
+			},
+		]);
+
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const model = harness.getModel();
+		expect(seen).toHaveLength(2);
+		expect(seen[0].model).toBe(model.id);
+		expect(seen[0].available).toBeGreaterThan(0);
+		expect(seen[0].available).toBeLessThan(model.contextWindow);
+		// The first prelude expired; the second request recalls it at the tail after the live one.
+		expect(requests[1]).toEqual([
+			"system:",
+			"user:one",
+			"assistant:first",
+			"user:two",
+			"user:prelude",
+			"user:prelude",
+		]);
+		const recalled = harness.sessionManager.getBranch().filter((entry) => entry.type === "custom_message");
+		expect(recalled.every((entry) => entry.customType !== CONTEXT_RECALL_TYPE)).toBe(true);
+	});
+
+	it("reports a context handler that grows the request past the compaction threshold", async () => {
+		const harness = await createHarness({
+			models: [{ id: "small", contextWindow: 20_000 }],
+			extensionFactories: [
+				(pi) => {
+					pi.on("context", (event) => {
+						return {
+							messages: [
+								...event.messages,
+								{ role: "user", content: "x".repeat(40_000), timestamp: Date.now() },
+							],
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("ok")]);
+
+		await harness.session.prompt("one");
+
+		expect(harness.errors).toContainEqual(expect.objectContaining({ extensionPath: "<context>", event: "context" }));
+		expect(harness.errors[0].error).toMatch(/past the compaction threshold/);
 	});
 });
