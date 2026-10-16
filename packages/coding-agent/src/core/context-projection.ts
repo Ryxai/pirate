@@ -8,10 +8,12 @@
  * declares a priority; content without a declared priority is never evicted.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, JsonValue, TextContent } from "@earendil-works/pi-ai";
+import type { JsonValue } from "@earendil-works/pi-ai";
 import { estimateMessagesTokens } from "./compaction/compaction.ts";
-import type { CustomMessage, FieldKey } from "./messages.ts";
+import type { FieldKey } from "./fields.ts";
+import type { CustomMessage } from "./messages.ts";
 import {
+	messageContentBlocks,
 	type OmittedReason,
 	type ProjectedSessionEntry,
 	type SessionProjection,
@@ -89,26 +91,9 @@ function isEvictable(contribution: Contribution): contribution is Contribution &
 	return contribution.priority !== undefined && contribution.messages.length > 0;
 }
 
-function contentBlocks(message: AgentMessage): (TextContent | ImageContent)[] {
-	switch (message.role) {
-		case "user":
-		case "custom":
-			return typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
-		case "assistant":
-			return message.content.filter((block): block is TextContent => block.type === "text");
-		case "toolResult":
-			return message.content;
-		case "compactionSummary":
-		case "branchSummary":
-			return [{ type: "text", text: message.summary }];
-		default:
-			return [];
-	}
-}
-
 /** Re-send an entry's content after the transcript as one custom message. */
 function recallMessage(entry: ProjectedSessionEntry, messages: AgentMessage[]): CustomMessage | undefined {
-	const content = messages.flatMap(contentBlocks);
+	const content = messages.flatMap(messageContentBlocks);
 	if (content.length === 0) return undefined;
 	return {
 		role: "custom",

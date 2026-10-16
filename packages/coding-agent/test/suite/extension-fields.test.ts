@@ -4,8 +4,7 @@ import { join } from "node:path";
 import type { JsonValue } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import type { FieldKey } from "../../src/core/messages.ts";
-import { fieldKey, getField } from "../../src/core/messages.ts";
+import { type FieldKey, fieldKey, getField } from "../../src/core/fields.ts";
 import { type SessionEntry, SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, firstUserEntryId, type Harness } from "./harness.ts";
 
@@ -46,7 +45,7 @@ describe("extension fields in agent runs", () => {
 							display: false,
 							fields: { [key as string]: 3 },
 						});
-						pi.appendEntry("scoring-state", { total: 3 }, { [key as string]: 4 });
+						pi.appendEntry("scoring-state", { total: 3 }, { fields: { [key as string]: 4 } });
 					});
 					pi.on("turn_end", (_event, ctx) => {
 						for (const entry of ctx.sessionManager.getBranch()) {
@@ -67,7 +66,7 @@ describe("extension fields in agent runs", () => {
 		await harness.session.prompt("one");
 
 		expect(key).toBe("scoring/score@1");
-		expect(key).toBe(fieldKey("scoring", "score", 1));
+		expect(key).toBe(fieldKey({ namespace: "scoring", name: "score", version: 1 }));
 		const [note] = entriesOfType(harness, "custom_message");
 		const [state] = entriesOfType(harness, "custom");
 		expect(note).toMatchObject({ customType: "note", content: "scored note", fields: { "scoring/score@1": 3 } });
@@ -102,33 +101,7 @@ describe("extension fields in agent runs", () => {
 		});
 	});
 
-	it("returns the key to every registrant and reports a load-time conflict once a mode binds", async () => {
-		const keys: FieldKey[] = [];
-		const harness = await createHarness({
-			extensionFactories: [
-				{ name: "first", factory: (pi) => void keys.push(pi.registerField(SCORE)) },
-				{
-					name: "second",
-					factory: (pi) => void keys.push(pi.registerField(SCORE), pi.registerField({ ...SCORE, version: 2 })),
-				},
-			],
-		});
-		harnesses.push(harness);
-
-		expect(keys).toEqual(["scoring/score@1", "scoring/score@1", "scoring/score@2"]);
-		// Conflicts found while extensions load are held until a mode binds and can show them.
-		expect(harness.errors).toEqual([]);
-		await harness.session.bindExtensions({});
-		expect(harness.errors).toEqual([
-			{
-				extensionPath: "<inline:second>",
-				event: "register_field",
-				error: 'Field "scoring/score@1" is already registered by extension "<inline:first>"',
-			},
-		]);
-	});
-
-	it("reports a conflicting registration made at runtime immediately, and not a re-registration by the owner", async () => {
+	it("rejects a key another extension registered, at runtime as at load", async () => {
 		const keys: FieldKey[] = [];
 		const harness = await createHarness({
 			extensionFactories: [
@@ -152,13 +125,13 @@ describe("extension fields in agent runs", () => {
 
 		await harness.session.prompt("one");
 
-		expect(keys).toEqual(["scoring/score@1", "scoring/score@1", "scoring/score@1"]);
+		expect(keys).toEqual(["scoring/score@1", "scoring/score@1"]);
 		expect(harness.errors).toEqual([
-			{
+			expect.objectContaining({
 				extensionPath: "<inline:other>",
-				event: "register_field",
+				event: "before_agent_start",
 				error: 'Field "scoring/score@1" is already registered by extension "<inline:owner>"',
-			},
+			}),
 		]);
 	});
 });
@@ -171,8 +144,8 @@ describe("annotations in agent runs", () => {
 	});
 
 	it("annotates at turn_end through a boundary draft and pi.annotate, visible to later handlers", async () => {
-		const score = fieldKey("scoring", "score", 1);
-		const note = fieldKey("scoring", "note", 1);
+		const score = fieldKey({ namespace: "scoring", name: "score", version: 1 });
+		const note = fieldKey({ namespace: "scoring", name: "note", version: 1 });
 		let turn = 0;
 		let firstAssistantId: string | undefined;
 		const fromManager: Record<FieldKey, JsonValue>[] = [];
@@ -258,7 +231,7 @@ describe("annotations in agent runs", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.on("turn_end", () => {
-						pi.annotate("missing", { [fieldKey("scoring", "score", 1)]: 1 });
+						pi.annotate("missing", { [fieldKey({ namespace: "scoring", name: "score", version: 1 })]: 1 });
 					});
 				},
 			],

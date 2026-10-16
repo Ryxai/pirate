@@ -265,37 +265,6 @@ class BuiltInHeader extends ExpandableText {
 	}
 }
 
-/** A displayed custom message with a dim note below it while it contributes nothing on the current branch. */
-export class CustomMessageChatItem extends Container implements Expandable {
-	private readonly message: CustomMessageComponent;
-	private readonly marker: ThemedText;
-	private markerText: string | undefined;
-
-	constructor(message: CustomMessageComponent, outputPad: number) {
-		super();
-		this.message = message;
-		this.marker = new ThemedText(() => (this.markerText ? theme.fg("dim", this.markerText) : ""), outputPad, 0);
-		this.addChild(message);
-		this.addChild(this.marker);
-	}
-
-	setExpanded(expanded: boolean): void {
-		this.message.setExpanded(expanded);
-	}
-
-	setOutputPad(outputPad: number): void {
-		this.message.setOutputPad(outputPad);
-		this.marker.setPaddingX(outputPad);
-	}
-
-	/** `expired`, `superseded` or `omitted`; undefined removes the note. */
-	setMarker(text: string | undefined): void {
-		if (this.markerText === text) return;
-		this.markerText = text;
-		this.marker.invalidate();
-	}
-}
-
 type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
@@ -549,10 +518,8 @@ export class InteractiveMode {
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 
-	// Displayed custom messages by entry id, for their omission notes (see refreshCustomMessageMarkers)
-	private customMessageItems = new Map<string, CustomMessageChatItem>();
-	// Rendered from message_start before the session persisted them; keyed once their entries exist
-	private unkeyedCustomMessageItems: CustomMessageChatItem[] = [];
+	// Displayed custom messages in append order; one rendered from message_start is keyed once its entry exists
+	private customMessageComponents: { component: CustomMessageComponent; entryId?: string }[] = [];
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -3923,28 +3890,28 @@ export class InteractiveMode {
 		}
 	}
 
-	/** Clear the transcript and the custom message items it held. */
+	/** Clear the transcript and the custom message components it held. */
 	private clearChat(): void {
 		this.chatContainer.clear();
-		this.customMessageItems.clear();
-		this.unkeyedCustomMessageItems = [];
+		this.customMessageComponents = [];
 	}
 
 	/**
 	 * Note below each displayed custom message whether it still contributes on the current branch.
-	 * Items rendered from message_start are keyed here once persisted: both lists are in append order.
+	 * Components rendered from message_start are keyed here once persisted; both are in append order.
 	 */
 	private refreshCustomMessageMarkers(): void {
-		if (this.customMessageItems.size === 0 && this.unkeyedCustomMessageItems.length === 0) return;
+		if (this.customMessageComponents.length === 0) return;
+		const unkeyed = this.customMessageComponents.filter((item) => item.entryId === undefined);
 		for (const { sourceEntry, omitted } of this.sessionManager.buildSessionProjection().entries) {
 			if (sourceEntry.type !== "custom_message" || !sourceEntry.display) continue;
-			let item = this.customMessageItems.get(sourceEntry.id);
+			let item = this.customMessageComponents.find((candidate) => candidate.entryId === sourceEntry.id);
 			if (!item) {
-				item = this.unkeyedCustomMessageItems.shift();
+				item = unkeyed.shift();
 				if (!item) continue;
-				this.customMessageItems.set(sourceEntry.id, item);
+				item.entryId = sourceEntry.id;
 			}
-			item.setMarker(omitted === "edit" ? "omitted" : omitted);
+			item.component.setMarker(omitted === "edit" ? "omitted" : omitted);
 		}
 		this.ui.requestRender();
 	}
@@ -3979,14 +3946,9 @@ export class InteractiveMode {
 						this.getMarkdownThemeWithSettings(),
 						this.outputPad,
 					);
-					const item = new CustomMessageChatItem(component, this.outputPad);
-					item.setExpanded(this.toolOutputExpanded);
-					this.chatContainer.addChild(item);
-					if (options?.entryId) {
-						this.customMessageItems.set(options.entryId, item);
-					} else {
-						this.unkeyedCustomMessageItems.push(item);
-					}
+					component.setExpanded(this.toolOutputExpanded);
+					this.chatContainer.addChild(component);
+					this.customMessageComponents.push({ component, entryId: options?.entryId });
 				}
 				break;
 			}

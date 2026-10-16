@@ -1057,7 +1057,7 @@ export class AgentSession {
 			let entryId: string;
 			switch (draft.type) {
 				case "custom":
-					entryId = manager.appendCustomEntry(draft.customType, draft.data, draft.fields);
+					entryId = manager.appendCustomEntry(draft.customType, draft.data, { fields: draft.fields });
 					break;
 				case "custom_message":
 					entryId = manager.appendCustomMessageEntry(draft);
@@ -2035,6 +2035,9 @@ export class AgentSession {
 				timestamp: Date.now(),
 			});
 		}
+		// Inject any pending "nextTurn" messages as context alongside the starting message
+		messages.push(...this._pendingNextTurnMessages);
+		this._pendingNextTurnMessages = [];
 		// A handler message with a bad ref is reported and left out here, before the run starts,
 		// instead of failing when the message is persisted mid-run.
 		for (const msg of result.messages) {
@@ -2048,9 +2051,6 @@ export class AgentSession {
 				});
 			}
 		}
-		// Inject any pending "nextTurn" messages as context alongside the starting message
-		messages.push(...this._pendingNextTurnMessages);
-		this._pendingNextTurnMessages = [];
 		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
@@ -2430,7 +2430,7 @@ export class AgentSession {
 	 * at message_end, where a throw would end the run instead.
 	 */
 	private _createCustomMessage(message: CustomMessageInput): CustomMessage {
-		const content = message.ref === undefined ? {} : { content: this.sessionManager.copyRefContent(message.ref) };
+		const content = message.ref === undefined ? {} : { content: this.sessionManager.getEntryContent(message.ref) };
 		// Untyped extensions can pass null/missing content; createCustomMessage normalizes at ingestion.
 		return createCustomMessage({ ...message, ...content }, new Date().toISOString());
 	}
@@ -3425,7 +3425,6 @@ export class AgentSession {
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		this._extensionRunner.reportUnhandledMcpServers();
-		this._extensionRunner.reportFieldConflicts();
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
 	}
 
@@ -3551,8 +3550,8 @@ export class AgentSession {
 						});
 					});
 				},
-				appendEntry: (customType, data, fields) => {
-					const entryId = this.sessionManager.appendCustomEntry(customType, data, fields);
+				appendEntry: (customType, data, options) => {
+					const entryId = this.sessionManager.appendCustomEntry(customType, data, options);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
 						this._emit({ type: "entry_appended", entry });
@@ -3848,7 +3847,6 @@ export class AgentSession {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 			this._extensionRunner.reportUnhandledMcpServers();
-			this._extensionRunner.reportFieldConflicts();
 			await this.extendResourcesFromExtensions("reload");
 		}
 	}

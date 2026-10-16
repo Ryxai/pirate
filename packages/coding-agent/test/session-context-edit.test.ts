@@ -5,7 +5,7 @@ import {
 	estimateProjectedContextTokens,
 	prepareCompaction,
 } from "../src/core/compaction/index.ts";
-import { fieldKey } from "../src/core/messages.ts";
+import { fieldKey } from "../src/core/fields.ts";
 import { type FileEntry, SessionManager } from "../src/core/session-manager.ts";
 
 function text(message: { content: string | Array<{ type: string; text?: string }> }): string {
@@ -447,8 +447,8 @@ describe("session context edits", () => {
 });
 
 describe("annotations", () => {
-	const status = fieldKey("review", "status", 1);
-	const note = fieldKey("review", "note", 1);
+	const status = fieldKey({ namespace: "review", name: "status", version: 1 });
+	const note = fieldKey({ namespace: "review", name: "note", version: 1 });
 
 	it("resolves the latest value per key and clears on null", () => {
 		const session = SessionManager.inMemory();

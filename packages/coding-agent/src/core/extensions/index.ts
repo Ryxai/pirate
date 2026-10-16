@@ -99,8 +99,6 @@ export type {
 	ExtensionUIDialogOptions,
 	ExtensionVirtualModel,
 	ExtensionWidgetOptions,
-	FieldHolder,
-	FieldSpec,
 	FindToolCallEvent,
 	FindToolResultEvent,
 	GetActiveToolsHandler,

@@ -1231,77 +1231,40 @@ describe("ExtensionRunner", () => {
 	describe("fields", () => {
 		const spec = { namespace: "scoring", name: "score", version: 1 };
 
-		it("reports a key a second extension registers during loading and keeps the first owner", async () => {
+		it("returns the key and rejects a key another extension registered", async () => {
 			const runtime = createExtensionRuntime();
 			const eventBus = createEventBus();
 			const keys: string[] = [];
-			const first = await loadExtensionFromFactory(
+			await loadExtensionFromFactory(
 				(pi) => {
-					keys.push(pi.registerField(spec));
+					keys.push(pi.registerField(spec), pi.registerField(spec));
 				},
 				tempDir,
 				eventBus,
 				runtime,
 				"<inline:first>",
 			);
-			const second = await loadExtensionFromFactory(
-				(pi) => {
-					keys.push(pi.registerField(spec));
-					keys.push(pi.registerField({ ...spec, version: 2 }));
-				},
+			await expect(
+				loadExtensionFromFactory(
+					(pi) => void pi.registerField(spec),
+					tempDir,
+					eventBus,
+					runtime,
+					"<inline:second>",
+				),
+			).rejects.toThrow('Field "scoring/score@1" is already registered by extension "<inline:first>"');
+			await loadExtensionFromFactory(
+				(pi) => void keys.push(pi.registerField({ ...spec, version: 2 })),
 				tempDir,
 				eventBus,
 				runtime,
 				"<inline:second>",
 			);
-			const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
-			const errors: ExtensionError[] = [];
-			runner.onError((error) => errors.push(error));
 
 			expect(keys).toEqual(["scoring/score@1", "scoring/score@1", "scoring/score@2"]);
-
-			runner.bindCore(extensionActions, extensionContextActions);
-
-			expect(errors).toEqual([
-				{
-					extensionPath: "<inline:second>",
-					event: "register_field",
-					error: 'Field "scoring/score@1" is already registered by extension "<inline:first>"',
-				},
-			]);
 		});
 
-		it("holds load-time conflicts until an error listener is attached and reports each once", async () => {
-			const runtime = createExtensionRuntime();
-			const eventBus = createEventBus();
-			const first = await loadExtensionFromFactory(
-				(pi) => void pi.registerField(spec),
-				tempDir,
-				eventBus,
-				runtime,
-				"<inline:first>",
-			);
-			const second = await loadExtensionFromFactory(
-				(pi) => void pi.registerField(spec),
-				tempDir,
-				eventBus,
-				runtime,
-				"<inline:second>",
-			);
-			const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
-			runner.bindCore(extensionActions, extensionContextActions);
-
-			const errors: ExtensionError[] = [];
-			runner.onError((error) => errors.push(error));
-			expect(errors).toEqual([]);
-
-			runner.reportFieldConflicts();
-			expect(errors).toMatchObject([{ extensionPath: "<inline:second>", event: "register_field" }]);
-			runner.reportFieldConflicts();
-			expect(errors).toHaveLength(1);
-		});
-
-		it("checks registrations made after binding immediately, and never against the owner itself", async () => {
+		it("checks registrations made after loading against the owner", async () => {
 			const runtime = createExtensionRuntime();
 			const eventBus = createEventBus();
 			let firstApi: ExtensionAPI | undefined;
@@ -1326,15 +1289,12 @@ describe("ExtensionRunner", () => {
 				"<inline:second>",
 			);
 			const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
-			const errors: ExtensionError[] = [];
-			runner.onError((error) => errors.push(error));
 			runner.bindCore(extensionActions, extensionContextActions);
 
 			expect(firstApi?.registerField(spec)).toBe("scoring/score@1");
-			expect(errors).toEqual([]);
-
-			expect(secondApi?.registerField(spec)).toBe("scoring/score@1");
-			expect(errors).toMatchObject([{ extensionPath: "<inline:second>", event: "register_field" }]);
+			expect(() => secondApi?.registerField(spec)).toThrow(
+				'Field "scoring/score@1" is already registered by extension "<inline:first>"',
+			);
 		});
 
 		it("drops the registrations of an extension whose factory fails", async () => {
@@ -1409,8 +1369,8 @@ describe("ExtensionRunner", () => {
 			api?.annotate("entry-1", { "scoring/score@1": 3, "notes/text@1": null });
 			expect(annotate).toHaveBeenCalledWith("entry-1", { "scoring/score@1": 3, "notes/text@1": null });
 
-			api?.appendEntry("state", { n: 1 }, { "scoring/score@1": 3 });
-			expect(appendEntry).toHaveBeenCalledWith("state", { n: 1 }, { "scoring/score@1": 3 });
+			api?.appendEntry("state", { n: 1 }, { fields: { "scoring/score@1": 3 } });
+			expect(appendEntry).toHaveBeenCalledWith("state", { n: 1 }, { fields: { "scoring/score@1": 3 } });
 			api?.appendEntry("state");
 			expect(appendEntry).toHaveBeenLastCalledWith("state", undefined, undefined);
 		});

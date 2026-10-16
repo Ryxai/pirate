@@ -62,10 +62,11 @@ import type { CompactionPreparation, CompactionResult } from "../compaction/inde
 import type { ContextBudget, ProjectedContext, ProjectionFilter } from "../context-projection.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
+import type { FieldHolder, FieldKey, FieldSpec } from "../fields.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
-import type { ContextVisibility, CustomMessage, CustomMessageInput, FieldHolder, FieldKey } from "../messages.ts";
+import type { ContextVisibility, CustomMessage, CustomMessageInput } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type {
@@ -1003,7 +1004,9 @@ export interface CustomEntryDraft {
 	fields?: Record<FieldKey, JsonValue>;
 }
 
-export type CustomMessageEntryDraft = { type: "custom_message" } & CustomMessageInput;
+export interface CustomMessageEntryDraft extends CustomMessageInput {
+	type: "custom_message";
+}
 
 export interface ContextEditEntryDraft {
 	type: "context_edit";
@@ -1619,17 +1622,6 @@ export interface ResolvedCommand extends RegisteredCommand {
 // biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
 
-/** Identity of an extension-owned field; see {@link ExtensionAPI.registerField}. */
-export interface FieldSpec {
-	/** Owner of the field, such as the extension's name. */
-	namespace: string;
-	name: string;
-	/** Bumped when the value's shape changes; entries written under the old key keep it. */
-	version: number;
-}
-
-export type { FieldHolder } from "../messages.ts";
-
 /**
  * ExtensionAPI passed to extension factory functions.
  */
@@ -1775,8 +1767,8 @@ export interface ExtensionAPI {
 	 * Register a field this extension owns and return its key, `"<namespace>/<name>@<version>"`.
 	 * Fields hold values other code may read, under `fields` on entries, messages, and annotations;
 	 * keep private state in `details` or `data`. Pi never interprets them, and it cannot tell which
-	 * extension wrote an entry: set fields only on entries you create. A key another extension
-	 * registered in this load is reported as an extension error; the key is still returned.
+	 * extension wrote an entry: set fields only on entries you create. Registering a key another
+	 * extension owns throws.
 	 */
 	registerField(spec: FieldSpec): FieldKey;
 
@@ -1807,10 +1799,10 @@ export interface ExtensionAPI {
 	): void;
 
 	/**
-	 * Append a custom entry to the session for state persistence (not sent to LLM). `fields` holds
-	 * values other code may read, by registered key; `data` is the extension's own state.
+	 * Append a custom entry to the session for state persistence (not sent to LLM). `data` is the
+	 * extension's own state; `options.fields` holds values other code may read, by registered key.
 	 */
-	appendEntry<T = unknown>(customType: string, data?: T, fields?: Record<FieldKey, JsonValue>): void;
+	appendEntry<T = unknown>(customType: string, data?: T, options?: { fields?: Record<FieldKey, JsonValue> }): void;
 
 	// =========================================================================
 	// Session Metadata
@@ -1830,7 +1822,7 @@ export interface ExtensionAPI {
 	 * value per key wins and null clears a key; read them with `ctx.sessionManager.getAnnotations()`.
 	 * Throws when the target does not exist or is not on the active branch.
 	 */
-	annotate(targetId: string, fields: Record<FieldKey, JsonValue | null>): void;
+	annotate(entryId: string, fields: Record<FieldKey, JsonValue | null>): void;
 
 	/** Execute a shell command. */
 	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
@@ -2186,7 +2178,7 @@ export type SendUserMessageHandler = (
 export type AppendEntryHandler = <T = unknown>(
 	customType: string,
 	data?: T,
-	fields?: Record<FieldKey, JsonValue>,
+	options?: { fields?: Record<FieldKey, JsonValue> },
 ) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
@@ -2224,7 +2216,7 @@ export type SetThinkingLevelHandler = (level: ThinkingLevel) => void;
 
 export type SetLabelHandler = (entryId: string, label: string | undefined) => void;
 
-export type AnnotateHandler = (targetId: string, fields: Record<FieldKey, JsonValue | null>) => void;
+export type AnnotateHandler = (entryId: string, fields: Record<FieldKey, JsonValue | null>) => void;
 
 /**
  * Shared state created by loader, used during registration and runtime.
@@ -2238,15 +2230,6 @@ export interface ExtensionRuntimeState {
 	pendingNativeProviderRegistrations: Array<{ provider: Provider; extensionPath: string }>;
 	/** Virtual model registrations queued during extension loading, processed when runner binds. */
 	pendingVirtualModelRegistrations: Array<{ definition: VirtualModelDefinition; extensionPath: string }>;
-	/** Field registrations queued during extension loading, processed when runner binds. */
-	pendingFieldRegistrations: Array<{ key: FieldKey; extensionPath: string }>;
-	/**
-	 * Record a field key and the extension that registered it.
-	 *
-	 * Before bindCore(): queues the registration. After bindCore(): the runner records it and
-	 * reports a key another extension registered.
-	 */
-	registerField: (key: FieldKey, extensionPath: string) => void;
 	/** Create an extension context. Throws before the runner binds. */
 	createContext: () => ExtensionContext;
 	/** Throws when this extension instance is stale after runtime replacement. */
@@ -2266,6 +2249,8 @@ export interface ExtensionRuntimeState {
 	unregisterProvider: (name: string, extensionPath?: string) => void;
 	/** Servers registered with `pi.registerMcpServer()`. */
 	mcpServers: McpServerRegistry;
+	/** Owning extension path of each key registered with `pi.registerField()`. */
+	fieldOwners: Map<FieldKey, string>;
 	registerVirtualModel: (definition: VirtualModelDefinition, extensionPath?: string) => void;
 	unregisterVirtualModel: (provider: string, id: string) => void;
 }

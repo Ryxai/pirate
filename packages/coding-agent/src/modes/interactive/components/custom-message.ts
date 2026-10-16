@@ -17,6 +17,8 @@ export class CustomMessageComponent extends Container {
 	private markdownTheme: MarkdownTheme;
 	private _expanded = false;
 	private outputPad: number;
+	private marker: string | undefined;
+	private markerText?: Text;
 
 	constructor(
 		message: CustomMessage<unknown>,
@@ -52,6 +54,14 @@ export class CustomMessageComponent extends Container {
 		}
 	}
 
+	/** Dim note below the message, such as `expired`; undefined removes it. */
+	setMarker(marker: string | undefined): void {
+		if (this.marker !== marker) {
+			this.marker = marker;
+			this.rebuild();
+		}
+	}
+
 	override invalidate(): void {
 		super.invalidate();
 		this.rebuild();
@@ -64,6 +74,10 @@ export class CustomMessageComponent extends Container {
 			this.customComponent = undefined;
 		}
 		this.removeChild(this.box);
+		if (this.markerText) {
+			this.removeChild(this.markerText);
+			this.markerText = undefined;
+		}
 
 		// Try custom renderer first - it handles its own styling
 		if (this.customRenderer) {
@@ -77,6 +91,7 @@ export class CustomMessageComponent extends Container {
 					// Custom renderer provides its own styled component
 					this.customComponent = component;
 					this.addChild(component);
+					this.addMarker();
 					return;
 				}
 			} catch {
@@ -110,5 +125,12 @@ export class CustomMessageComponent extends Container {
 				color: (text: string) => theme.fg("customMessageText", text),
 			}),
 		);
+		this.addMarker();
+	}
+
+	private addMarker(): void {
+		if (!this.marker) return;
+		this.markerText = new Text(theme.fg("dim", this.marker), this.outputPad, 0);
+		this.addChild(this.markerText);
 	}
 }

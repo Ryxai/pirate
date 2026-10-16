@@ -9,7 +9,7 @@ import {
 	type ProjectionFilter,
 	projectContext,
 } from "../src/core/context-projection.ts";
-import { fieldKey } from "../src/core/messages.ts";
+import { fieldKey } from "../src/core/fields.ts";
 import { SessionManager, type SessionProjection } from "../src/core/session-manager.ts";
 import { toolResultMsg as toolResult, userMsg as user } from "./utilities.ts";
 
@@ -148,8 +148,8 @@ describe("projectContext", () => {
 
 	it("tells the filter the annotations resolved for each entry", () => {
 		const { manager, userId, preludeId } = session();
-		const score = fieldKey("ext", "score", 1);
-		const tag = fieldKey("ext", "tag", 1);
+		const score = fieldKey({ namespace: "ext", name: "score", version: 1 });
+		const tag = fieldKey({ namespace: "ext", name: "tag", version: 1 });
 		manager.appendAnnotation(userId, { [score]: 3, [tag]: "draft" });
 		manager.appendAnnotation(userId, { [tag]: null });
 		const seen = infos(manager.buildSessionProjection());

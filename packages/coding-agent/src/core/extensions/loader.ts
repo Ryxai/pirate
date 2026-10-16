@@ -15,8 +15,8 @@ import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
+import { type FieldHolder, type FieldKey, type FieldSpec, fieldKey, getField, listFields } from "../fields.ts";
 import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
-import { type FieldKey, fieldKey, getField, listFields } from "../messages.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
@@ -28,8 +28,6 @@ import type {
 	ExtensionFactory,
 	ExtensionRuntime,
 	ExtensionVirtualModel,
-	FieldHolder,
-	FieldSpec,
 	LoadExtensionsResult,
 	MarkdownTransformer,
 	MessageRenderer,
@@ -191,8 +189,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		pendingProviderRegistrations: [],
 		pendingNativeProviderRegistrations: [],
 		mcpServers: new McpServerRegistry(),
+		fieldOwners: new Map(),
 		pendingVirtualModelRegistrations: [],
-		pendingFieldRegistrations: [],
 		createContext: notInitialized,
 		assertActive,
 		invalidate: (message) => {
@@ -235,9 +233,6 @@ export function createExtensionRuntime(): ExtensionRuntime {
 			runtime.pendingVirtualModelRegistrations = runtime.pendingVirtualModelRegistrations.filter(
 				({ definition }) => definition.provider !== provider || definition.id !== id,
 			);
-		},
-		registerField: (key, extensionPath) => {
-			runtime.pendingFieldRegistrations.push({ key, extensionPath });
 		},
 	};
 
@@ -378,11 +373,14 @@ function createExtensionAPI(
 			extension.toolRenderers.push(resolver);
 		},
 
-		// Fields - the runner records the owner once it binds and reports conflicts
 		registerField(spec: FieldSpec): FieldKey {
 			assertActive();
-			const key = fieldKey(spec.namespace, spec.name, spec.version);
-			applyRuntimeChange(() => runtime.registerField(key, extension.path));
+			const key = fieldKey(spec);
+			const owner = runtime.fieldOwners.get(key);
+			if (owner !== undefined && owner !== extension.path) {
+				throw new Error(`Field "${key}" is already registered by extension "${owner}"`);
+			}
+			applyRuntimeChange(() => runtime.fieldOwners.set(key, extension.path));
 			return key;
 		},
 

@@ -33,6 +33,7 @@ import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { estimateMessagesTokens } from "./compaction/compaction.ts";
+import { type FieldKey, isFieldRecord } from "./fields.ts";
 import {
 	type BashExecutionMessage,
 	type ContextExpiry,
@@ -43,8 +44,6 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 	customMessageOptions,
-	type FieldKey,
-	isFieldRecord,
 } from "./messages.ts";
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -626,11 +625,6 @@ function endsVisibility(pending: PendingExpiry, entry: SessionEntry): Expiry["re
 	return undefined;
 }
 
-function hasTokenLifetime(pending: PendingExpiry): boolean {
-	const until = pending.visibility.until;
-	return typeof until === "object" && until !== null && "tokens" in until;
-}
-
 /**
  * The entry on `path` that ends each bounded contribution, keyed by target entry id.
  * A custom message with visibility starts one; a context edit on a target replaces its pending
@@ -642,7 +636,11 @@ function findExpiries(path: SessionEntry[], byId: Map<string, SessionEntry>): Ma
 	path.forEach((entry, index) => {
 		const isAssistant = entry.type === "message" && entry.message.role === "assistant";
 		// Token lifetimes count the raw content of every following entry; estimate it only while one is pending.
-		const tokens = pending.some(hasTokenLifetime) ? estimateMessagesTokens(sessionEntryToContextMessages(entry)) : 0;
+		const tokens = pending.some(
+			({ visibility: { until } }) => typeof until === "object" && until !== null && "tokens" in until,
+		)
+			? estimateMessagesTokens(sessionEntryToContextMessages(entry))
+			: 0;
 		for (let i = pending.length - 1; i >= 0; i--) {
 			if (isAssistant) pending[i].assistantMessages++;
 			pending[i].tokens += tokens;
@@ -666,41 +664,27 @@ function findExpiries(path: SessionEntry[], byId: Map<string, SessionEntry>): Ma
 	return expiries;
 }
 
-/** Entries that contribute messages to model context. */
-function hasContent(entry: SessionEntry): boolean {
-	return (
-		entry.type === "message" ||
-		entry.type === "custom_message" ||
-		entry.type === "compaction" ||
-		entry.type === "branch_summary"
-	);
-}
-
 /**
- * Copy of the content a custom message re-sends when it refers to `entry`: the text and images of
- * a user or custom message, the text of an assistant message, a tool result, or a summary.
- * Undefined for entries without model content.
+ * Model content of a message as text and image blocks: a user or custom message's content, the
+ * text of an assistant message, a tool result, or a summary. Session files are parsed without
+ * validation, so missing content counts as none.
  */
-function modelContent(entry: SessionEntry): CustomMessageEntry["content"] | undefined {
-	switch (entry.type) {
-		case "message": {
-			const message = entry.message;
-			// Session files are parsed without validation; old or hand-edited files can lack content.
-			if (message.role === "user" || message.role === "toolResult") {
-				return typeof message.content === "string" ? message.content : [...(message.content ?? [])];
-			}
-			if (message.role === "assistant") {
-				return (message.content ?? []).filter((block): block is TextContent => block.type === "text");
-			}
-			return undefined;
-		}
-		case "custom_message":
-			return typeof entry.content === "string" ? entry.content : [...(entry.content ?? [])];
-		case "compaction":
-		case "branch_summary":
-			return entry.summary;
+export function messageContentBlocks(message: AgentMessage): (TextContent | ImageContent)[] {
+	switch (message.role) {
+		case "user":
+		case "custom":
+			return typeof message.content === "string"
+				? [{ type: "text", text: message.content }]
+				: (message.content ?? []);
+		case "assistant":
+			return (message.content ?? []).filter((block): block is TextContent => block.type === "text");
+		case "toolResult":
+			return message.content ?? [];
+		case "compactionSummary":
+		case "branchSummary":
+			return [{ type: "text", text: message.summary }];
 		default:
-			return undefined;
+			return [];
 	}
 }
 
@@ -764,10 +748,15 @@ export function buildSessionProjection(
 		const omitted: OmittedReason | undefined =
 			edit?.replacement === null ? "edit" : expired ? expiry?.reason : undefined;
 		const priority = resolvePriority(sourceEntry, edit);
+		const contentBearing =
+			sourceEntry.type === "message" ||
+			sourceEntry.type === "custom_message" ||
+			sourceEntry.type === "compaction" ||
+			sourceEntry.type === "branch_summary";
 		return {
 			sourceEntry,
 			messages: stale || expired ? [] : projectContextEntry(sourceEntry, edit),
-			...(omitted !== undefined && !stale && hasContent(sourceEntry) ? { omitted } : {}),
+			...(omitted !== undefined && !stale && contentBearing ? { omitted } : {}),
 			...(priority !== undefined ? { priority } : {}),
 		};
 	});
@@ -1495,12 +1484,12 @@ export class SessionManager {
 	}
 
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
-	appendCustomEntry(customType: string, data?: unknown, fields?: Record<FieldKey, JsonValue>): string {
+	appendCustomEntry(customType: string, data?: unknown, options?: { fields?: Record<FieldKey, JsonValue> }): string {
 		const entry: CustomEntry = {
 			type: "custom",
 			customType,
 			data,
-			...(fields ? { fields } : {}),
+			...(options?.fields ? { fields: options.fields } : {}),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -1540,13 +1529,14 @@ export class SessionManager {
 	/**
 	 * Append a custom message entry (for extensions) that participates in LLM context.
 	 * See CustomMessageEntry for the fields. With `ref`, the content is copied from that entry
-	 * instead of `content` (see copyRefContent). Returns the entry id.
+	 * instead of `content` (see getEntryContent). Returns the entry id.
 	 */
 	appendCustomMessageEntry<T = unknown>(message: CustomMessageInput<T>): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
 			customType: message.customType,
-			content: message.ref === undefined ? message.content : this.copyRefContent(message.ref),
+			// Untyped extensions can pass null/missing content; normalize at ingestion.
+			content: message.ref === undefined ? (message.content ?? []) : this.getEntryContent(message.ref),
 			display: message.display,
 			details: message.details,
 			...customMessageOptions(message),
@@ -1559,15 +1549,14 @@ export class SessionManager {
 	}
 
 	/**
-	 * Model content of the entry a custom message re-sends: text and images, text of assistant
-	 * messages, summaries. Throws when the entry does not exist or carries no model content, such
-	 * as an assistant message of tool calls only.
+	 * Model content of an entry as text and image blocks (see messageContentBlocks). Throws when the
+	 * entry does not exist or carries none, such as an assistant message of tool calls only.
 	 */
-	copyRefContent(ref: string): CustomMessageEntry["content"] {
-		const entry = this.byId.get(ref);
-		if (!entry) throw new Error(`Entry ${ref} not found`);
-		const content = modelContent(entry);
-		if (content === undefined || content.length === 0) throw new Error(`Entry ${ref} does not carry model content`);
+	getEntryContent(id: string): (TextContent | ImageContent)[] {
+		const entry = this.byId.get(id);
+		if (!entry) throw new Error(`Entry ${id} not found`);
+		const content = sessionEntryToContextMessages(entry).flatMap(messageContentBlocks);
+		if (content.length === 0) throw new Error(`Entry ${id} does not carry model content`);
 		return content;
 	}
 
@@ -1649,7 +1638,10 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	/** Annotations of an entry resolved over the active branch: the latest value per key wins, null clears. */
+	/**
+	 * Annotations of an entry resolved over the active branch: the latest value per key wins, null
+	 * clears. Walks the branch; readers that need many entries use `buildSessionProjection().annotations`.
+	 */
 	getAnnotations(targetId: string): Record<FieldKey, JsonValue> {
 		return resolveAnnotations(this.getBranch()).get(targetId) ?? {};
 	}

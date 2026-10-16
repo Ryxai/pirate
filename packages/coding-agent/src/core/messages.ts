@@ -7,6 +7,7 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, JsonValue, Message, TextContent } from "@earendil-works/pi-ai";
+import { type FieldKey, isFieldRecord } from "./fields.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -37,34 +38,6 @@ export interface BashExecutionMessage {
 	timestamp: number;
 	/** If true, this message is excluded from LLM context (!! prefix) */
 	excludeFromContext?: boolean;
-}
-
-/** Key of an extension-owned field: "<namespace>/<name>@<version>". */
-export type FieldKey = string;
-
-export function fieldKey(namespace: string, name: string, version: number): FieldKey {
-	return `${namespace}/${name}@${version}`;
-}
-
-/** An entry or message that can carry extension-owned fields. */
-export interface FieldHolder {
-	fields?: Record<FieldKey, JsonValue>;
-}
-
-/** Read one extension-owned field of an entry or message. */
-export function getField<T extends JsonValue>(holder: FieldHolder, key: FieldKey): T | undefined {
-	return holder.fields?.[key] as T | undefined;
-}
-
-/** Keys of the fields present on an entry or message, all of them or those of one namespace. */
-export function listFields(holder: FieldHolder, namespace?: string): FieldKey[] {
-	const keys = Object.keys(holder.fields ?? {});
-	return namespace === undefined ? keys : keys.filter((key) => key.startsWith(`${namespace}/`));
-}
-
-/** Session files are parsed without validation: only a plain object counts as a `fields` record. */
-export function isFieldRecord(value: unknown): value is Record<FieldKey, JsonValue> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -99,10 +72,11 @@ export interface ContextVisibility {
  * Message type for extension-injected messages via sendMessage().
  * These are custom messages that extensions can inject into the conversation.
  */
-export interface CustomMessage<T = unknown> {
-	role: "custom";
+/** Fields of a custom message that callers supply; Pi adds the role and timestamp. */
+export interface CustomMessageInput<T = unknown> {
 	customType: string;
-	content: string | (TextContent | ImageContent)[];
+	/** Required unless `ref` is set, which copies the referenced entry's content instead. */
+	content?: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
 	/** Omitted: the message stays in model context like any other. */
@@ -111,13 +85,15 @@ export interface CustomMessage<T = unknown> {
 	position?: "tail";
 	/** Eviction order under pressure; omitted means conversation, never evicted. */
 	priority?: number;
-	/**
-	 * Entry this message re-sends; content was copied from it when appended. The input type still
-	 * requires `content`, which is ignored when `ref` is set.
-	 */
+	/** Entry this message re-sends; its content was copied when the message was appended. */
 	ref?: string;
 	/** Extension-owned values by FieldKey. Pi never interprets them. */
 	fields?: Record<FieldKey, JsonValue>;
+}
+
+export interface CustomMessage<T = unknown> extends CustomMessageInput<T> {
+	role: "custom";
+	content: string | (TextContent | ImageContent)[];
 	timestamp: number;
 }
 
@@ -188,16 +164,7 @@ export function createCompactionSummaryMessage(
 	};
 }
 
-/** Fields of a custom message that callers supply; Pi adds the role and timestamp. */
-export type CustomMessageInput<T = unknown> = Pick<
-	CustomMessage<T>,
-	"customType" | "content" | "display" | "details" | "visibility" | "position" | "priority" | "ref" | "fields"
->;
-
-/**
- * The projection fields of a custom message input that are set and well-formed. Session files and
- * untyped extensions can hold malformed values; the entry and the message of one send agree on them.
- */
+/** The projection fields of a custom message input that are set and well-formed. */
 export function customMessageOptions(
 	message: CustomMessageInput,
 ): Pick<CustomMessage, "visibility" | "position" | "priority" | "ref" | "fields"> {

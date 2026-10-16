@@ -122,8 +122,6 @@ export type {
 	ExtensionUIDialogOptions,
 	ExtensionVirtualModel,
 	ExtensionWidgetOptions,
-	FieldHolder,
-	FieldSpec,
 	FindToolCallEvent,
 	GrepToolCallEvent,
 	InlineExtension,
@@ -228,19 +226,18 @@ export {
 	wrapRegisteredTool,
 	wrapRegisteredTools,
 } from "./core/extensions/index.ts";
-// Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
-export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
-export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
 export {
-	type ContextExpiry,
-	type ContextVisibility,
-	type CustomMessageInput,
-	convertToLlm,
+	type FieldHolder,
 	type FieldKey,
+	type FieldSpec,
 	fieldKey,
 	getField,
 	listFields,
-} from "./core/messages.ts";
+} from "./core/fields.ts";
+// Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
+export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
+export { type ContextExpiry, type ContextVisibility, type CustomMessageInput, convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
 	type ModelScopeDiagnostic,

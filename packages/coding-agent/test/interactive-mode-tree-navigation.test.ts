@@ -7,7 +7,7 @@ import { SettingsManager } from "../src/core/settings-manager.ts";
 import { CustomMessageComponent } from "../src/modes/interactive/components/custom-message.ts";
 import type { StatusIndicator } from "../src/modes/interactive/components/status-indicator.ts";
 import type { TreeSelectorComponent } from "../src/modes/interactive/components/tree-selector.ts";
-import { CustomMessageChatItem, InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { assistantMsg, userMsg } from "./utilities.ts";
 
@@ -166,18 +166,17 @@ describe("InteractiveMode custom message markers", () => {
 
 	type MarkerUI = {
 		sessionManager: SessionManager;
-		customMessageItems: Map<string, CustomMessageChatItem>;
-		unkeyedCustomMessageItems: CustomMessageChatItem[];
+		customMessageComponents: { component: CustomMessageComponent; entryId?: string }[];
 		ui: { requestRender: () => void };
 	};
 	const refresh = Reflect.get(InteractiveMode.prototype, "refreshCustomMessageMarkers") as (this: MarkerUI) => void;
 
-	function noteItem(text: string): CustomMessageChatItem {
+	function noteComponent(text: string): CustomMessageComponent {
 		const message: CustomMessage = { role: "custom", customType: "note", content: text, display: true, timestamp: 0 };
-		return new CustomMessageChatItem(new CustomMessageComponent(message), 1);
+		return new CustomMessageComponent(message);
 	}
 
-	const rendered = (item: CustomMessageChatItem) => stripVTControlCharacters(item.render(80).join("\n"));
+	const rendered = (component: CustomMessageComponent) => stripVTControlCharacters(component.render(80).join("\n"));
 
 	it("keys items rendered before persistence and notes expired messages", () => {
 		const sessionManager = SessionManager.inMemory();
@@ -188,17 +187,15 @@ describe("InteractiveMode custom message markers", () => {
 			display: true,
 			visibility: { until: "assistant_message" },
 		});
-		const pending = noteItem("temporary");
+		const pending = noteComponent("temporary");
 		const ui: MarkerUI = {
 			sessionManager,
-			customMessageItems: new Map(),
-			unkeyedCustomMessageItems: [pending],
+			customMessageComponents: [{ component: pending }],
 			ui: { requestRender: vi.fn() },
 		};
 
 		refresh.call(ui);
-		expect(ui.customMessageItems.get(noteId)).toBe(pending);
-		expect(ui.unkeyedCustomMessageItems).toEqual([]);
+		expect(ui.customMessageComponents).toEqual([{ component: pending, entryId: noteId }]);
 		expect(rendered(pending)).not.toContain("expired");
 
 		sessionManager.appendMessage(assistantMsg("reply"));
@@ -225,14 +222,13 @@ describe("InteractiveMode custom message markers", () => {
 		});
 		sessionManager.appendContextEdit(omittedId, null);
 		const items = new Map([
-			[omittedId, noteItem("cut")],
-			[olderId, noteItem("older")],
-			[newerId, noteItem("newer")],
+			[omittedId, noteComponent("cut")],
+			[olderId, noteComponent("older")],
+			[newerId, noteComponent("newer")],
 		]);
 		const ui: MarkerUI = {
 			sessionManager,
-			customMessageItems: items,
-			unkeyedCustomMessageItems: [],
+			customMessageComponents: [...items].map(([entryId, component]) => ({ component, entryId })),
 			ui: { requestRender: vi.fn() },
 		};
 

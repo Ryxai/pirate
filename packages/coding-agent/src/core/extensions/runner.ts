@@ -16,7 +16,6 @@ import type { CacheWarmingAction } from "../cache-warmer.ts";
 import type { ProjectedContext } from "../context-projection.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
-import type { FieldKey } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type { SessionManager } from "../session-manager.ts";
@@ -396,9 +395,6 @@ export class ExtensionRunner {
 	/** Registered MCP servers already reported as unhandled. */
 	private readonly reportedMcpServers = new Set<string>();
 	/** Field keys registered in this load, by the extension that registered each first. */
-	private readonly fieldOwners = new Map<FieldKey, string>();
-	/** Field key conflicts not yet delivered to an error listener. */
-	private readonly fieldConflicts: ExtensionError[] = [];
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -533,11 +529,6 @@ export class ExtensionRunner {
 			}
 		}
 		this.runtime.pendingVirtualModelRegistrations = [];
-		for (const { key, extensionPath } of this.runtime.pendingFieldRegistrations) {
-			this.registerField(key, extensionPath);
-		}
-		this.runtime.pendingFieldRegistrations = [];
-		this.runtime.registerField = (key, extensionPath) => this.registerField(key, extensionPath);
 
 		// From this point on, provider registration/unregistration takes effect immediately
 		// without requiring a /reload.
@@ -791,32 +782,6 @@ export class ExtensionRunner {
 				error: `MCP server "${server.name}" is registered, but no loaded extension connects MCP servers; another extension may have replaced the built-in MCP support`,
 			});
 		}
-	}
-
-	/** Record `extensionPath` as the owner of `key`; a key another extension owns is a conflict. */
-	registerField(key: FieldKey, extensionPath: string): void {
-		const owner = this.fieldOwners.get(key);
-		if (owner === undefined) {
-			this.fieldOwners.set(key, extensionPath);
-			return;
-		}
-		if (owner === extensionPath) return;
-		this.fieldConflicts.push({
-			extensionPath,
-			event: "register_field",
-			error: `Field "${key}" is already registered by extension "${owner}"`,
-		});
-		this.reportFieldConflicts();
-	}
-
-	/**
-	 * Report field key conflicts once an error listener can receive them. Registrations made while
-	 * extensions load are flushed by bindCore(), before a mode has attached its listener, so the
-	 * session calls this again after binding.
-	 */
-	reportFieldConflicts(): void {
-		if (this.errorListeners.size === 0) return;
-		for (const error of this.fieldConflicts.splice(0)) this.emitError(error);
 	}
 
 	hasHandlers(eventType: string): boolean {

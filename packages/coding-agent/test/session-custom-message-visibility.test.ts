@@ -2,7 +2,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type ImageContent } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { estimateProjectedContextTokens, prepareCompaction } from "../src/core/compaction/index.ts";
-import { type CustomMessage, fieldKey, getField } from "../src/core/messages.ts";
+import { fieldKey, getField } from "../src/core/fields.ts";
+import type { CustomMessage } from "../src/core/messages.ts";
 import {
 	type CustomEntry,
 	type CustomMessageEntry,
@@ -392,16 +393,16 @@ describe("custom message ref", () => {
 			session.getEntry(
 				session.appendCustomMessageEntry({ customType: "recall", content: "ignored", display: false, ref }),
 			) as CustomMessageEntry;
-		expect(recall(userId)).toMatchObject({ ref: userId, content: "original request" });
+		expect(recall(userId)).toMatchObject({ ref: userId, content: [{ type: "text", text: "original request" }] });
 		expect(recall(assistantId).content).toEqual([{ type: "text", text: "answer" }]);
 		expect(recall(resultId).content).toEqual([{ type: "text", text: "file contents" }]);
 		expect(recall(customId).content).toEqual([{ type: "text", text: "note" }, image]);
-		expect(recall(branchId).content).toBe("abandoned branch");
-		expect(recall(compactionId).content).toBe("the summary");
+		expect(recall(branchId).content).toEqual([{ type: "text", text: "abandoned branch" }]);
+		expect(recall(compactionId).content).toEqual([{ type: "text", text: "the summary" }]);
 		expect(session.buildSessionProjection().messages.at(-1)).toMatchObject({
 			role: "custom",
 			ref: compactionId,
-			content: "the summary",
+			content: [{ type: "text", text: "the summary" }],
 		});
 	});
 
@@ -427,14 +428,14 @@ describe("custom message ref", () => {
 describe("entry fields", () => {
 	it("round-trips fields on custom entries and custom messages", () => {
 		const session = SessionManager.inMemory();
-		const key = fieldKey("flow", "phase", 1);
+		const key = fieldKey({ namespace: "flow", name: "phase", version: 1 });
 		expect(key).toBe("flow/phase@1");
 
-		const entryId = session.appendCustomEntry("flow.state", { step: 2 }, { [key]: "implement" });
+		const entryId = session.appendCustomEntry("flow.state", { step: 2 }, { fields: { [key]: "implement" } });
 		const entry = session.getEntry(entryId) as CustomEntry;
 		expect(entry).toMatchObject({ data: { step: 2 }, fields: { [key]: "implement" } });
 		expect(getField(entry, key)).toBe("implement");
-		expect(getField(entry, fieldKey("flow", "phase", 2))).toBeUndefined();
+		expect(getField(entry, fieldKey({ namespace: "flow", name: "phase", version: 2 }))).toBeUndefined();
 
 		const messageId = session.appendCustomMessageEntry({
 			customType: "plan",
